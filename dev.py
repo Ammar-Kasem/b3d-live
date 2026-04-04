@@ -19,8 +19,8 @@ _render_window: vtk.vtkRenderWindow | None = None
 _view = None
 _server = None
 
-# cell index -> (source_hash, vtkActor)
-_cell_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
+# filepath -> {block_index -> (source_hash, vtkActor)}
+_file_cache: dict[str, dict[int, tuple[str, vtk.vtkActor]]] = {}
 
 # .py files belonging to the viewer itself — never trigger a CAD reload
 _VIEWER_FILES = {"dev.py", "viewer.py"}
@@ -144,15 +144,16 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     finally:
         sys.modules.pop("viewer", None)
 
+    cache     = _file_cache.setdefault(filepath, {})
     actors:    list[vtk.vtkActor] = []
     new_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
 
     for i, (var_name, node) in enumerate(build_blocks):
         h = hashlib.md5(ast.unparse(node).encode()).hexdigest()
 
-        if i in _cell_cache and _cell_cache[i][0] == h:
-            actors.append(_cell_cache[i][1])
-            new_cache[i] = _cell_cache[i]
+        if i in cache and cache[i][0] == h:
+            actors.append(cache[i][1])
+            new_cache[i] = cache[i]
             continue
 
         ns = dict(base_ns)
@@ -184,17 +185,17 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         except Exception as exc:
             print(f"[b3d] Tessellation error in '{var_name}': {exc}")
 
-    _cell_cache.clear()
-    _cell_cache.update(new_cache)
+    cache.clear()
+    cache.update(new_cache)
     return actors
 
 
-async def _watch_and_reload(filepath: str):
-    loop    = asyncio.get_running_loop()
-    dirpath = os.path.dirname(filepath) or "."
+async def _watch_and_reload(filepaths: list[str]):
+    loop = asyncio.get_running_loop()
+    dirs = list({os.path.dirname(fp) or "." for fp in filepaths})
 
     try:
-        async for changes in awatch(dirpath):
+        async for changes in awatch(*dirs):
             changed = {
                 os.path.basename(p)
                 for c, p in changes
@@ -203,23 +204,28 @@ async def _watch_and_reload(filepath: str):
             if not (changed - _VIEWER_FILES):
                 continue
 
-            _invalidate_local_modules(dirpath)
+            for d in dirs:
+                _invalidate_local_modules(d)
 
-            actors = await loop.run_in_executor(None, _load_actors, filepath)
-            if not actors:
+            all_actors: list[vtk.vtkActor] = []
+            for filepath in filepaths:
+                all_actors.extend(
+                    await loop.run_in_executor(None, _load_actors, filepath)
+                )
+            if not all_actors:
                 continue
 
             _renderer.RemoveAllViewProps()
-            for actor in actors:
+            for actor in all_actors:
                 _renderer.AddActor(actor)
             _renderer.ResetCamera()
             _render_window.Render()
             if _view is not None:
                 _view.update()
-            cached = sum(1 for i in _cell_cache if _cell_cache[i][0] != "")
-            print(f"[b3d] {len(actors)} shape(s), {cached} from cache")
+            cached = sum(len(c) for c in _file_cache.values())
+            print(f"[b3d] {len(all_actors)} shape(s), {cached} from cache")
             if _server is not None:
-                _server.state.shape_count = len(actors)
+                _server.state.shape_count = len(all_actors)
                 _server.state.cache_count = cached
                 _server.state.dirty("shape_count", "cache_count")
     except asyncio.CancelledError:
@@ -244,7 +250,7 @@ def _set_axis_view(direction, up):
         _view.update(push_camera=True)
 
 
-def _build_ui(server, filepath, initial_count=0):
+def _build_ui(server, filepaths, initial_count=0):
     global _view
     state, ctrl = server.state, server.controller
 
@@ -252,7 +258,7 @@ def _build_ui(server, filepath, initial_count=0):
     state.cache_count = 0
     state.wireframe = False
     state.dark_bg = True
-    state.filename = os.path.basename(filepath)
+    state.filenames = "  |  ".join(os.path.basename(fp) for fp in filepaths)
 
     def reset_camera():
         if _view is not None:
@@ -329,7 +335,7 @@ def _build_ui(server, filepath, initial_count=0):
                 size="x-small", color="primary", variant="tonal", classes="mr-2",
             )
             vuetify3.VChip(
-                "{{ filename }}",
+                "{{ filenames }}",
                 size="x-small", variant="outlined", classes="mr-1",
             )
 
@@ -344,35 +350,37 @@ def _build_ui(server, filepath, initial_count=0):
 def main():
     global _server
     parser = argparse.ArgumentParser()
-    parser.add_argument("file", nargs="?", default="main.py")
+    parser.add_argument("files", nargs="*", default=["main.py"])
     parser.add_argument("--port", type=int, default=1234)
     args = parser.parse_args()
 
-    filepath = os.path.abspath(args.file)
+    filepaths = [os.path.abspath(f) for f in args.files]
     _server = get_server(client_type="vue3")
 
     _setup_vtk()
 
-    actors = _load_actors(filepath)
-    if actors:
-        for actor in actors:
-            _renderer.AddActor(actor)
+    all_actors: list[vtk.vtkActor] = []
+    for filepath in filepaths:
+        all_actors.extend(_load_actors(filepath))
+    for actor in all_actors:
+        _renderer.AddActor(actor)
+    if all_actors:
         _renderer.ResetCamera()
         _render_window.Render()
-        print(f"[b3d] {len(actors)} shape(s) loaded")
+        print(f"[b3d] {len(all_actors)} shape(s) loaded from {len(filepaths)} file(s)")
 
-    _build_ui(_server, filepath, initial_count=len(actors))
+    _build_ui(_server, filepaths, initial_count=len(all_actors))
 
     @_server.controller.on_server_ready.add
     def _open_browser(**_):
         import webbrowser
         webbrowser.open(f"http://localhost:{args.port}")
 
-    print(f"[b3d] Watching  : {args.file}")
+    print(f"[b3d] Watching  : {', '.join(args.files)}")
     print(f"[b3d] Browser   : http://localhost:{args.port}")
 
     async def _run():
-        asyncio.create_task(_watch_and_reload(filepath))
+        asyncio.create_task(_watch_and_reload(filepaths))
         await _server.start(exec_mode="task", open_browser=False, port=args.port)
 
     try:
