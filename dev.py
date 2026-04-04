@@ -186,34 +186,37 @@ async def _watch_and_reload(filepath: str):
     loop    = asyncio.get_running_loop()
     dirpath = os.path.dirname(filepath) or "."
 
-    async for changes in awatch(dirpath):
-        changed = {
-            os.path.basename(p)
-            for c, p in changes
-            if c in (Change.modified, Change.added) and p.endswith(".py")
-        }
-        if not (changed - _VIEWER_FILES):
-            continue
+    try:
+        async for changes in awatch(dirpath):
+            changed = {
+                os.path.basename(p)
+                for c, p in changes
+                if c in (Change.modified, Change.added) and p.endswith(".py")
+            }
+            if not (changed - _VIEWER_FILES):
+                continue
 
-        _invalidate_local_modules(dirpath)
+            _invalidate_local_modules(dirpath)
 
-        actors = await loop.run_in_executor(None, _load_actors, filepath)
-        if not actors:
-            continue
+            actors = await loop.run_in_executor(None, _load_actors, filepath)
+            if not actors:
+                continue
 
-        _renderer.RemoveAllViewProps()
-        for actor in actors:
-            _renderer.AddActor(actor)
-        _renderer.ResetCamera()
-        _render_window.Render()
-        if _view is not None:
-            _view.update()
-        cached = sum(1 for i in _cell_cache if _cell_cache[i][0] != "")
-        print(f"[b3d] {len(actors)} shape(s) — {cached} from cache")
-        if _server is not None:
-            _server.state.shape_count = len(actors)
-            _server.state.cache_count = cached
-            _server.state.dirty("shape_count", "cache_count")
+            _renderer.RemoveAllViewProps()
+            for actor in actors:
+                _renderer.AddActor(actor)
+            _renderer.ResetCamera()
+            _render_window.Render()
+            if _view is not None:
+                _view.update()
+            cached = sum(1 for i in _cell_cache if _cell_cache[i][0] != "")
+            print(f"[b3d] {len(actors)} shape(s), {cached} from cache")
+            if _server is not None:
+                _server.state.shape_count = len(actors)
+                _server.state.cache_count = cached
+                _server.state.dirty("shape_count", "cache_count")
+    except asyncio.CancelledError:
+        pass
 
 
 def _set_axis_view(direction, up):
@@ -353,13 +356,22 @@ def main():
 
     _build_ui(_server, filepath, initial_count=len(actors))
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.call_soon(loop.create_task, _watch_and_reload(filepath))
+    @_server.controller.on_server_ready.add
+    def _open_browser(**_):
+        import webbrowser
+        webbrowser.open(f"http://localhost:{args.port}")
 
     print(f"[b3d] Watching  : {args.file}")
     print(f"[b3d] Browser   : http://localhost:{args.port}")
-    _server.start(open_browser=True, port=args.port)
+
+    async def _run():
+        asyncio.create_task(_watch_and_reload(filepath))
+        await _server.start(exec_mode="task", open_browser=False, port=args.port)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
