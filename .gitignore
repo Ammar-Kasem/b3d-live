@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+*.fossil
+.fslckout
+uv.lock
+*.swp
+.DS_Store

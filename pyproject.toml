@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "build123d-trame"
+version = "1.0.0"
+description = "build123d live CAD viewer"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "build123d>=0.8.0",
+    "py-lib3mf<=2.3.1",
+    "vtk>=9.4",
+    "trame>=3.6",
+    "trame-vtk>=2.8",
+    "trame-vtklocal>=0.8",
+    "trame-vuetify>=2.7",
+    "pyvista>=0.44",
+]
+
+[project.scripts]
+b3d-live = "dev:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
