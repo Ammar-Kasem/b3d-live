@@ -1,30 +1,49 @@
 """Live build123d viewer — VTK WASM via trame-vtklocal, no server-side GL."""
 
 import argparse
+import ast
 import asyncio
-import ctypes
 import hashlib
 import os
 import re
-import struct
 import sys
 import types
 
 import vtk
 from trame.app import get_server
-from trame.ui.html import DivLayout
-from trame.widgets import vtklocal
+from trame.ui.vuetify3 import SinglePageLayout
+from trame.widgets import vuetify3, vtklocal
+from watchfiles import awatch, Change
 
 _renderer: vtk.vtkRenderer | None = None
 _render_window: vtk.vtkRenderWindow | None = None
 _view = None
+_server = None
 
 # cell index -> (source_hash, vtkActor)
 _cell_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
 
-_libc = ctypes.CDLL(None)
-_IN_CLOSE_WRITE = 0x00000008
-_IN_MOVED_TO    = 0x00000080
+# .py files belonging to the viewer itself — never trigger a CAD reload
+_VIEWER_FILES = {"dev.py", "viewer.py"}
+
+
+def _cell_hash(src: str) -> str:
+    """Hash a cell's semantic content, ignoring comments and whitespace."""
+    try:
+        normalized = ast.unparse(ast.parse(src))
+    except SyntaxError:
+        normalized = src
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+
+def _invalidate_local_modules(dirpath: str) -> None:
+    """Remove modules loaded from dirpath from sys.modules so they are
+    re-imported fresh on the next exec."""
+    dirpath = os.path.abspath(dirpath)
+    for name in list(sys.modules):
+        f = getattr(sys.modules[name], "__file__", None)
+        if f and os.path.abspath(os.path.dirname(f)) == dirpath:
+            del sys.modules[name]
 
 
 def _setup_vtk():
@@ -108,7 +127,7 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     new_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
 
     for i, cell in enumerate(cells[1:], 1):
-        h = hashlib.md5(cell.encode()).hexdigest()
+        h = _cell_hash(cell)
 
         if i in _cell_cache and _cell_cache[i][0] == h:
             actors.append(_cell_cache[i][1])
@@ -164,68 +183,163 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
 
 
 async def _watch_and_reload(filepath: str):
-    loop  = asyncio.get_running_loop()
-    fname = os.path.basename(filepath).encode()
+    loop    = asyncio.get_running_loop()
+    dirpath = os.path.dirname(filepath) or "."
 
-    ifd = _libc.inotify_init()
-    _libc.inotify_add_watch(
-        ifd,
-        (os.path.dirname(filepath) or ".").encode(),
-        _IN_CLOSE_WRITE | _IN_MOVED_TO,
-    )
+    async for changes in awatch(dirpath):
+        changed = {
+            os.path.basename(p)
+            for c, p in changes
+            if c in (Change.modified, Change.added) and p.endswith(".py")
+        }
+        if not (changed - _VIEWER_FILES):
+            continue
 
-    gate = asyncio.Event()
+        _invalidate_local_modules(dirpath)
 
-    def _on_readable():
-        raw = os.read(ifd, 4096)
-        off = 0
-        while off < len(raw):
-            _wd, mask, _cookie, nlen = struct.unpack_from("iIII", raw, off)
-            off += 16
-            name = raw[off : off + nlen].rstrip(b"\x00")
-            off += nlen
-            if name == fname and mask & (_IN_CLOSE_WRITE | _IN_MOVED_TO):
-                gate.set()
+        actors = await loop.run_in_executor(None, _load_actors, filepath)
+        if not actors:
+            continue
 
-    loop.add_reader(ifd, _on_readable)
-    try:
-        while True:
-            await gate.wait()
-            gate.clear()
-
-            actors = await loop.run_in_executor(None, _load_actors, filepath)
-            if not actors:
-                continue
-
-            _renderer.RemoveAllViewProps()
-            for actor in actors:
-                _renderer.AddActor(actor)
-            _renderer.ResetCamera()
-            _render_window.Render()
-            if _view is not None:
-                _view.update()
-            cached = sum(1 for i in _cell_cache if _cell_cache[i][0] != "")
-            print(f"[b3d] {len(actors)} shape(s) — {cached} from cache")
-    finally:
-        loop.remove_reader(ifd)
-        os.close(ifd)
+        _renderer.RemoveAllViewProps()
+        for actor in actors:
+            _renderer.AddActor(actor)
+        _renderer.ResetCamera()
+        _render_window.Render()
+        if _view is not None:
+            _view.update()
+        cached = sum(1 for i in _cell_cache if _cell_cache[i][0] != "")
+        print(f"[b3d] {len(actors)} shape(s) — {cached} from cache")
+        if _server is not None:
+            _server.state.shape_count = len(actors)
+            _server.state.cache_count = cached
+            _server.state.dirty("shape_count", "cache_count")
 
 
-def _build_ui(server):
+def _set_axis_view(direction, up):
+    bounds = _renderer.ComputeVisiblePropBounds()
+    if bounds[0] > bounds[1]:
+        return  # no visible props
+    cx = (bounds[0] + bounds[1]) / 2
+    cy = (bounds[2] + bounds[3]) / 2
+    cz = (bounds[4] + bounds[5]) / 2
+    dist = max(bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4]) * 2.5
+    camera = _renderer.GetActiveCamera()
+    camera.SetFocalPoint(cx, cy, cz)
+    camera.SetPosition(cx + direction[0]*dist, cy + direction[1]*dist, cz + direction[2]*dist)
+    camera.SetViewUp(*up)
+    _renderer.ResetCamera()
+    _render_window.Render()
+    if _view is not None:
+        _view.update(push_camera=True)
+
+
+def _build_ui(server, filepath, initial_count=0):
     global _view
-    with DivLayout(server) as layout:
-        layout.root.style = "width:100vw; height:100vh; margin:0; padding:0;"
-        _view = vtklocal.LocalView(_render_window, style="width:100%; height:100%;")
+    state, ctrl = server.state, server.controller
+
+    state.shape_count = initial_count
+    state.cache_count = 0
+    state.wireframe = False
+    state.dark_bg = True
+    state.filename = os.path.basename(filepath)
+
+    def reset_camera():
+        if _view is not None:
+            _view.reset_camera()
+
+    def toggle_wireframe():
+        state.wireframe = not state.wireframe
+        col = _renderer.GetActors()
+        col.InitTraversal()
+        actor = col.GetNextActor()
+        while actor:
+            if state.wireframe:
+                actor.GetProperty().SetRepresentationToWireframe()
+            else:
+                actor.GetProperty().SetRepresentationToSurface()
+            actor = col.GetNextActor()
+        _render_window.Render()
+        if _view is not None:
+            _view.update()
+
+    def toggle_background():
+        state.dark_bg = not state.dark_bg
+        if state.dark_bg:
+            _renderer.SetBackground(0.12, 0.12, 0.12)
+        else:
+            _renderer.SetBackground(0.95, 0.95, 0.95)
+        _render_window.Render()
+        if _view is not None:
+            _view.update()
+
+    ctrl.reset_camera      = reset_camera
+    ctrl.toggle_wireframe  = toggle_wireframe
+    ctrl.toggle_background = toggle_background
+    ctrl.view_x   = lambda: _set_axis_view(( 1,  0,  0), (0, 0, 1))
+    ctrl.view_y   = lambda: _set_axis_view(( 0, -1,  0), (0, 0, 1))
+    ctrl.view_z   = lambda: _set_axis_view(( 0,  0,  1), (0, 1, 0))
+    ctrl.view_iso = lambda: _set_axis_view(( 1, -1,  1), (0, 0, 1))
+
+    _btn = dict(variant="text", density="compact", size="small")
+
+    with SinglePageLayout(server) as layout:
+        layout.title.set_text("build123d")
+
+        with layout.toolbar as tb:
+            tb.density = "compact"
+
+            # ── centre: all action buttons ──────────────────────────────
+            vuetify3.VSpacer()
+            vuetify3.VBtn(
+                icon="mdi-vector-square", title="Wireframe",
+                click=ctrl.toggle_wireframe, **_btn,
+            )
+            vuetify3.VBtn(
+                icon="mdi-theme-light-dark", title="Toggle background",
+                click=ctrl.toggle_background, **_btn,
+            )
+            vuetify3.VBtn(
+                icon="mdi-fit-to-screen", title="Reset camera",
+                click=ctrl.reset_camera, **_btn,
+            )
+            vuetify3.VDivider(vertical=True, classes="mx-2")
+            vuetify3.VBtn("X", title="View along X", click=ctrl.view_x, **_btn)
+            vuetify3.VBtn("Y", title="View along Y", click=ctrl.view_y, **_btn)
+            vuetify3.VBtn("Z", title="View along Z", click=ctrl.view_z, **_btn)
+            vuetify3.VBtn(
+                icon="mdi-axis-arrow", title="Isometric",
+                click=ctrl.view_iso, **_btn,
+            )
+            vuetify3.VSpacer()
+
+            # ── right: live counters + filename ─────────────────────────
+            vuetify3.VChip(
+                "{{ shape_count }} shapes · {{ cache_count }} cached",
+                size="x-small", color="primary", variant="tonal", classes="mr-2",
+            )
+            vuetify3.VChip(
+                "{{ filename }}",
+                size="x-small", variant="outlined", classes="mr-1",
+            )
+
+        with layout.content:
+            with vuetify3.VContainer(fluid=True, classes="pa-0 fill-height"):
+                _view = vtklocal.LocalView(
+                    _render_window,
+                    style="width:100%; height:100%;",
+                )
 
 
 def main():
+    global _server
     parser = argparse.ArgumentParser()
     parser.add_argument("file", nargs="?", default="main.py")
     parser.add_argument("--port", type=int, default=1234)
     args = parser.parse_args()
 
     filepath = os.path.abspath(args.file)
-    server = get_server(client_type="vue3")
+    _server = get_server(client_type="vue3")
 
     _setup_vtk()
 
@@ -237,7 +351,7 @@ def main():
         _render_window.Render()
         print(f"[b3d] {len(actors)} shape(s) loaded")
 
-    _build_ui(server)
+    _build_ui(_server, filepath, initial_count=len(actors))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -245,7 +359,7 @@ def main():
 
     print(f"[b3d] Watching  : {args.file}")
     print(f"[b3d] Browser   : http://localhost:{args.port}")
-    server.start(open_browser=True, port=args.port)
+    _server.start(open_browser=True, port=args.port)
 
 
 if __name__ == "__main__":

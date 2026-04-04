@@ -15,7 +15,7 @@ dependencies = [
     "trame-vtk>=2.8",
     "trame-vtklocal>=0.8",
     "trame-vuetify>=2.7",
-    "pyvista>=0.44",
+    "watchfiles>=0.21",
 ]
 
 [project.scripts]
