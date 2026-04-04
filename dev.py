@@ -5,7 +5,6 @@ import ast
 import asyncio
 import hashlib
 import os
-import re
 import sys
 import types
 
@@ -27,13 +26,24 @@ _cell_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
 _VIEWER_FILES = {"dev.py", "viewer.py"}
 
 
-def _cell_hash(src: str) -> str:
-    """Hash a cell's semantic content, ignoring comments and whitespace."""
-    try:
-        normalized = ast.unparse(ast.parse(src))
-    except SyntaxError:
-        normalized = src
-    return hashlib.md5(normalized.encode()).hexdigest()
+_BUILD_CTXS = {"BuildPart", "BuildSketch", "BuildLine"}
+
+
+def _build_var(node: ast.stmt) -> str | None:
+    """Return the 'as' variable name if node is a top-level with BuildPart/Sketch/Line,
+    otherwise None."""
+    if not isinstance(node, ast.With):
+        return None
+    for item in node.items:
+        call = item.context_expr
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id in _BUILD_CTXS
+            and isinstance(item.optional_vars, ast.Name)
+        ):
+            return item.optional_vars.id
+    return None
 
 
 def _invalidate_local_modules(dirpath: str) -> None:
@@ -96,86 +106,83 @@ def _shape_to_actor(shape) -> vtk.vtkActor:
 
 
 def _load_actors(filepath: str) -> list[vtk.vtkActor]:
-    """Execute the file cell by cell, reusing cached actors for unchanged cells.
-
-    The file is split on # %% markers. The first cell (imports) always runs to
-    build a base namespace. Each subsequent cell executes independently in a
-    copy of that namespace; if its source hash matches the cache the cached
-    actor is reused and OCC + tessellation are skipped entirely.
-    """
+    """Parse the file with ast, find every top-level with BuildPart/Sketch/Line block,
+    and re-execute only those whose source hash changed.  No # %% markers needed."""
     with open(filepath) as f:
         src = f.read()
 
-    cells = [c.strip() for c in re.split(r"^# %%[^\n]*$", src, flags=re.MULTILINE) if c.strip()]
-    if not cells:
+    try:
+        tree = ast.parse(src, filename=filepath)
+    except SyntaxError as exc:
+        print(f"[b3d] Syntax error: {exc}")
         return []
 
-    # First cell: imports — always execute, builds the base namespace.
+    # Split top-level nodes into build blocks and setup code
+    build_blocks: list[tuple[str, ast.With]] = []
+    setup_nodes:  list[ast.stmt] = []
+    for node in tree.body:
+        var = _build_var(node)
+        if var:
+            build_blocks.append((var, node))
+        else:
+            setup_nodes.append(node)
+
+    if not build_blocks:
+        return []
+
+    # Execute setup (imports, helpers) to build base namespace; stub viewer.show
     base_ns: dict = {}
     fake = types.ModuleType("viewer")
     fake.show = lambda *a, **k: None
     sys.modules["viewer"] = fake
+    setup_mod = ast.fix_missing_locations(ast.Module(body=setup_nodes, type_ignores=[]))
     try:
-        exec(compile(cells[0], filepath, "exec"), base_ns)  # noqa: S102
+        exec(compile(setup_mod, filepath, "exec"), base_ns)  # noqa: S102
     except Exception as exc:
-        print(f"[b3d] Error in setup cell: {exc}")
-        return []
+        if not isinstance(exc, NameError):
+            print(f"[b3d] Setup error: {exc}")
     finally:
         sys.modules.pop("viewer", None)
 
-    actors: list[vtk.vtkActor] = []
+    actors:    list[vtk.vtkActor] = []
     new_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
 
-    for i, cell in enumerate(cells[1:], 1):
-        h = _cell_hash(cell)
+    for i, (var_name, node) in enumerate(build_blocks):
+        h = hashlib.md5(ast.unparse(node).encode()).hexdigest()
 
         if i in _cell_cache and _cell_cache[i][0] == h:
             actors.append(_cell_cache[i][1])
             new_cache[i] = _cell_cache[i]
             continue
 
-        # Changed cell — execute in its own copy of the import namespace.
         ns = dict(base_ns)
-        captured: list = []
+        block_mod = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+        try:
+            exec(compile(block_mod, filepath, "exec"), ns)  # noqa: S102
+        except Exception as exc:
+            print(f"[b3d] Block '{var_name}' error: {exc}")
+            continue
 
-        def _show(*args, **_):
-            for a in args:
-                if hasattr(a, "wrapped"):
-                    captured.append(a)
-                elif hasattr(a, "part") and hasattr(a.part, "wrapped"):
-                    captured.append(a.part)
-                elif hasattr(a, "sketch") and hasattr(a.sketch, "wrapped"):
-                    captured.append(a.sketch)
+        obj = ns.get(var_name)
+        shape = None
+        if obj is not None:
+            if hasattr(obj, "wrapped"):
+                shape = obj
+            elif hasattr(obj, "part") and obj.part:
+                shape = obj.part
+            elif hasattr(obj, "sketch") and obj.sketch:
+                shape = obj.sketch
 
-        ns["show"] = _show
+        if shape is None:
+            print(f"[b3d] Block '{var_name}': no shape captured")
+            continue
 
         try:
-            exec(compile(cell, filepath, "exec"), ns)  # noqa: S102
-        except NameError:
-            pass  # expected when a cell references shapes from other cells (e.g. show())
+            actor = _shape_to_actor(shape)
+            actors.append(actor)
+            new_cache[i] = (h, actor)
         except Exception as exc:
-            print(f"[b3d] Cell {i} error: {exc}")
-
-        if not captured:
-            from build123d import Shape, BuildPart, BuildSketch
-            for k, v in ns.items():
-                if k in base_ns:
-                    continue
-                if isinstance(v, Shape):
-                    captured.append(v)
-                elif isinstance(v, BuildPart) and v.part:
-                    captured.append(v.part)
-                elif isinstance(v, BuildSketch) and v.sketch:
-                    captured.append(v.sketch)
-
-        for shape in captured:
-            try:
-                actor = _shape_to_actor(shape)
-                actors.append(actor)
-                new_cache[i] = (h, actor)
-                break
-            except Exception as exc:
-                print(f"[b3d] Tessellation error in cell {i}: {exc}")
+            print(f"[b3d] Tessellation error in '{var_name}': {exc}")
 
     _cell_cache.clear()
     _cell_cache.update(new_cache)

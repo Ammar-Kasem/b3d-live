@@ -1,11 +1,8 @@
-# %%
 from build123d import *
 from viewer import show
 
-# %%
 # --- 1. Revolved vase profile ---
 with BuildPart() as vase:
-    # test comment if it will parsed in cache
     with BuildSketch(Plane.XZ) as sk:
         with BuildLine() as profile:
             Spline(
@@ -21,7 +18,6 @@ with BuildPart() as vase:
         make_face()
     revolve(axis=Axis.Z)
 
-# %%
 # --- 2. Swept pipe along a helix ---
 with BuildPart() as helix_pipe:
     helix_path = Helix(pitch=8, height=40, radius=12)
@@ -31,18 +27,16 @@ with BuildPart() as helix_pipe:
         Circle(2)
     sweep(path=helix_path)
 
-# %%
 # --- 3. Lofted transition solid ---
-# with BuildPart() as loft_solid:
-#     with BuildSketch(Plane.XY.offset(0)) as s1:
-#         Rectangle(30, 30)
-#     with BuildSketch(Plane.XY.offset(20)) as s2:
-#         Circle(18)
-#     with BuildSketch(Plane.XY.offset(40)) as s3:
-#         RegularPolygon(12, 6)
-#     loft()
+with BuildPart() as loft_solid:
+    with BuildSketch(Plane.XY.offset(0)) as s1:
+        Rectangle(30, 30)
+    with BuildSketch(Plane.XY.offset(20)) as s2:
+        Circle(18)
+    with BuildSketch(Plane.XY.offset(40)) as s3:
+        RegularPolygon(12, 6)
+    loft()
 
-# %%
 # --- 4. Gear-like toothed cylinder ---
 with BuildPart() as gear:
     Cylinder(20, 10)
@@ -50,7 +44,6 @@ with BuildPart() as gear:
         Cylinder(4, 10)
     Cylinder(8, 12, mode=Mode.SUBTRACT)
 
-# %%
 # --- 5. Filleted mounting bracket with counterbore and through-holes ---
 with BuildPart() as bracket:
     Box(60, 40, 8)
@@ -60,5 +53,4 @@ with BuildPart() as bracket:
     with GridLocations(36, 20, 2, 2):
         Cylinder(2.5, 8, mode=Mode.SUBTRACT)
 
-# %%
 show(vase.part, helix_pipe.part, loft_solid.part, gear.part, bracket.part)
