@@ -3,14 +3,24 @@
 A live-reloading browser viewer for [build123d](https://github.com/gumyr/build123d) CAD scripts.
 Save a `.py` file and only the blocks that actually changed rebuild — everything else stays cached.
 
+Two launch modes:
+
+| Mode | Command | Reload trigger |
+| ---- | ------- | -------------- |
+| **File watcher** | `b3d-live body.py` | file save |
+| **Editor LSP** | `b3d-lsp body.py` | every keystroke |
+
 ---
 
 ## Quick start
 
 ```bash
-# install
 uv sync
+```
 
+### File-watcher mode
+
+```bash
 # view a single file
 uv run b3d-live body.py
 
@@ -21,7 +31,31 @@ uv run b3d-live body.py cab.py
 uv run b3d-live body.py --port 8080
 ```
 
+### Editor LSP mode
+
+`b3d-lsp` is a language server that starts the viewer and reloads on every keystroke — no
+manual startup required.  Point your editor at it as a language server for Python files.
+
+```bash
+uv run b3d-lsp body.py cab.py
+```
+
 The browser opens automatically at `http://localhost:1234`.
+
+#### Helix
+
+```toml
+# ~/.config/helix/languages.toml
+[language-server.b3d-live]
+command = "/path/to/.venv/bin/b3d-lsp"
+args    = ["body.py", "cab.py"]
+
+[[language]]
+name = "python"
+language-servers = ["ruff", "b3d-live"]
+```
+
+Replace `/path/to/.venv` with the absolute path to the project's virtual environment.
 
 ---
 
@@ -33,7 +67,7 @@ waiting for all geometry to rebuild even when only one part changed.
 b3d-live uses **Tree-sitter incremental parsing** to sync the parse tree directly with the
 VTK scene graph:
 
-1. On each save, Tree-sitter re-parses only the bytes that changed.
+1. On each save (or keystroke in LSP mode), Tree-sitter re-parses only the bytes that changed.
 2. Every top-level `with BuildPart() as x:`, `with BuildSketch() as x:`, and
    `with BuildLine() as x:` block is an independent unit mapped 1:1 to a VTK actor.
 3. The raw byte edit region is compared against each block's byte span — only overlapping
@@ -88,6 +122,7 @@ reloaded independently. Their shapes are all rendered in the same scene:
 
 ```bash
 b3d-live body.py cab.py wheels.py
+b3d-lsp  body.py cab.py wheels.py
 ```
 
 Changes to one file do not invalidate the cache of the others.
@@ -116,7 +151,7 @@ the changed variable.
 
 ## How it compares
 
-|                      | b3d-live                  | ocp-vscode      | cq-editor       | YACV                |
+|                      | b3d-live / b3d-lsp        | ocp-vscode      | cq-editor       | YACV                |
 | -------------------- | ------------------------- | --------------- | --------------- | ------------------- |
 | Editor coupling      | none — any editor         | VS Code only    | built-in editor | none                |
 | Reload unit          | changed block only        | whole file      | whole file      | whole file          |
@@ -125,12 +160,15 @@ the changed variable.
 | Multi-file watch     | yes                       | no              | no              | no                  |
 | Cross-file deps      | yes                       | no              | no              | no                  |
 | Error resilience     | per-block, last good kept | blanks on error | blanks on error | blanks on error     |
+| Keystroke reload     | yes (LSP mode)            | no              | no              | no                  |
 | Static deployment    | no                        | no              | no              | yes                 |
 | Face/edge inspection | no                        | yes             | yes             | yes                 |
 
 ---
 
 ## Architecture
+
+### File-watcher mode (`b3d-live`)
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -157,6 +195,34 @@ the changed variable.
 └─────────────────────────────────────────────────────┘
 ```
 
+### LSP mode (`b3d-lsp`)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Editor (Helix, neovim, …)                          │
+│  starts b3d-lsp as a language server subprocess     │
+└──────────┬──────────────────────────────────────────┘
+           │  stdio (LSP protocol)
+┌──────────▼──────────────────────────────────────────┐
+│  b3d-lsp process (dev.py)                           │
+│                                                     │
+│  pygls LSP server ──► didChange / didSave           │
+│         │                    │                      │
+│         │            Tree-sitter incremental parse  │
+│         │                    │                      │
+│         │            classify + exec changed blocks │
+│         │                    │                      │
+│  diagnostics ◄──── tessellate → vtkActor            │
+│                               │                     │
+│                    trame-vtklocal push               │
+└───────────────────────────────┬─────────────────────┘
+                                │  WebSocket
+┌───────────────────────────────▼─────────────────────┐
+│  Browser                                            │
+│  VTK.wasm renders vtkRenderWindow mirror            │
+└─────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## Roadmap
@@ -178,6 +244,7 @@ the changed variable.
 | [trame-vuetify](https://github.com/Kitware/trame-vuetify)   | Vuetify 3 UI components           |
 | [watchfiles](https://github.com/samuelcolvin/watchfiles)    | Cross-platform file watcher       |
 | [tree-sitter](https://tree-sitter.github.io/)               | Incremental parser for change detection |
+| [pygls](https://github.com/openlawlibrary/pygls)            | LSP server framework              |
 
 ---
 
@@ -186,7 +253,7 @@ the changed variable.
 ### Project structure
 
 ```
-dev.py          main viewer — watcher, Tree-sitter parser, VTK pipeline, trame UI
+dev.py          main viewer — watcher, Tree-sitter parser, VTK pipeline, trame UI, LSP server
 test_dev.py     unit tests for the parsing layer (no VTK or build123d required)
 body.py         example: truck body
 cab.py          example: truck cab
@@ -211,7 +278,10 @@ uv run pytest test_dev.py
 | `_load_actors(filepath)`       | Core reload — parse, diff, exec changed blocks, tessellate              |
 | `_shape_to_actor(shape)`       | Tessellate a build123d Shape into a vtkActor                            |
 | `_watch_and_reload(filepaths)` | Async watcher loop — detects saves, calls `_load_actors`, updates scene |
+| `_build_lsp(filepaths, loop)`  | Build pygls LanguageServer with debounced reload handlers               |
 | `_build_ui(server, filepaths)` | Constructs the trame/Vuetify toolbar and VTK view                       |
+| `main()`                       | Entry point for `b3d-live` — file-watcher mode                         |
+| `lsp_main()`                   | Entry point for `b3d-lsp` — self-contained viewer+LSP stdio server     |
 
 ### Adding a new toolbar button
 
