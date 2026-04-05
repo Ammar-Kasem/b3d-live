@@ -15,15 +15,14 @@ built-in ast module:
      reverse dep graph.  When a helper module changes, only the watched files
      that actually import it are reloaded.
 
-Change detection uses MD5 of the normalised block source (same as before),
-since tree-sitter's has_changes flag requires tree.edit() calls that are not
-yet plumbed in at this layer.
+Change detection uses tree.edit() + old_tree.changed_ranges(new_tree) so only
+blocks whose byte range overlaps the changed region are re-executed.  No
+hashing required.
 """
 
 import argparse
 import ast
 import asyncio
-import hashlib
 import os
 import sys
 import types
@@ -40,8 +39,6 @@ from watchfiles import awatch, Change
 _PY_LANGUAGE = Language(tree_sitter_python.language())
 _ts_parser   = Parser(_PY_LANGUAGE)
 
-# In tree-sitter-python ≥ 0.23 the with_item uses as_pattern instead of
-# separate value:/alias: fields.
 _BUILD_BLOCK_QUERY = Query(_PY_LANGUAGE, """
 (with_statement
   (with_clause
@@ -69,14 +66,11 @@ _view   = None
 _server = None
 
 # ── Per-file state ─────────────────────────────────────────────────────────────
-# filepath -> {var_name -> (source_hash, vtkActor, build123d_obj)}
-_file_cache: dict[str, dict[str, tuple[str, vtk.vtkActor, object]]] = {}
-
-# filepath -> Tree-sitter Tree
-_file_trees: dict[str, object] = {}
-
-# filepath -> set of local filepaths it imports
-_dep_graph: dict[str, set[str]] = {}
+# filepath -> {var_name -> (vtkActor, build123d_obj)}
+_file_cache:   dict[str, dict[str, tuple[vtk.vtkActor, object]]] = {}
+_file_trees:   dict[str, object] = {}   # filepath -> Tree-sitter Tree
+_file_sources: dict[str, bytes]  = {}   # filepath -> last parsed source bytes
+_dep_graph:    dict[str, set[str]] = {} # filepath -> set of local deps
 
 _VIEWER_FILES = {"dev.py", "viewer.py"}
 _SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
@@ -84,20 +78,42 @@ _SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
 
 # ── Tree-sitter helpers ────────────────────────────────────────────────────────
 
+def _compute_edit(old: bytes, new: bytes) -> tuple[int, int, int]:
+    """Return (start_byte, old_end_byte, new_end_byte) of the changed region."""
+    start = 0
+    while start < len(old) and start < len(new) and old[start] == new[start]:
+        start += 1
+    old_end, new_end = len(old), len(new)
+    while old_end > start and new_end > start and old[old_end-1] == new[new_end-1]:
+        old_end -= 1
+        new_end -= 1
+    return start, old_end, new_end
+
+
+def _byte_to_point(src: bytes, offset: int) -> tuple[int, int]:
+    """Convert a byte offset to a (row, col) tree-sitter point."""
+    prefix  = src[:offset]
+    row     = prefix.count(b"\n")
+    last_nl = prefix.rfind(b"\n")
+    return (row, offset - (last_nl + 1))
+
+
+def _block_changed(node, changed_ranges) -> bool:
+    """True if the block's byte range overlaps any changed range."""
+    for r in changed_ranges:
+        if r.start_byte < node.end_byte and r.end_byte > node.start_byte:
+            return True
+    return False
+
+
 def _find_build_blocks(tree, source: bytes) -> list[tuple[str, object]]:
     """Return [(var_name, node)] for every top-level build context block."""
     result  = []
-    cursor  = QueryCursor(_BUILD_BLOCK_QUERY)
-    matches = cursor.matches(tree.root_node)
+    matches = QueryCursor(_BUILD_BLOCK_QUERY).matches(tree.root_node)
     for _, caps in matches:
-        ctx_nodes   = caps.get("ctx",   [])
-        var_nodes   = caps.get("var",   [])
-        block_nodes = caps.get("block", [])
-        if not (ctx_nodes and var_nodes and block_nodes):
-            continue
-        ctx_node   = ctx_nodes[0]
-        var_node   = var_nodes[0]
-        block_node = block_nodes[0]
+        ctx_node   = caps.get("ctx",   [])[0]
+        var_node   = caps.get("var",   [])[0]
+        block_node = caps.get("block", [])[0]
         if ctx_node.text.decode() not in _BUILD_CTXS:
             continue
         if block_node.parent is None or block_node.parent.type != "module":
@@ -107,15 +123,12 @@ def _find_build_blocks(tree, source: bytes) -> list[tuple[str, object]]:
 
 
 def _referenced_names(node) -> set[str]:
-    """Recursively collect all identifier text values in a node's subtree."""
     names: set[str] = set()
-
     def _walk(n):
         if n.type == "identifier":
             names.add(n.text.decode())
         for child in n.children:
             _walk(child)
-
     _walk(node)
     return names
 
@@ -133,7 +146,6 @@ def _is_show_call_node(node) -> bool:
 def _parse_metadata_stmt(node, source: bytes) -> tuple[str, str, str] | None:
     """If node is `var.(part|sketch).(color|label|name) = expr`,
     return (var_name, attr_name, value_src).  Otherwise None."""
-    # Top-level assignments are wrapped in expression_statement in the module
     if node.type == "expression_statement" and node.children:
         node = node.children[0]
     if node.type != "assignment":
@@ -164,10 +176,8 @@ def _parse_metadata_stmt(node, source: bytes) -> tuple[str, str, str] | None:
 
 
 def _update_dep_graph(filepath: str, tree, source: bytes) -> None:
-    """Rebuild the dependency entry for filepath from its import statements."""
     local_dir = os.path.dirname(filepath)
-    cursor    = QueryCursor(_IMPORT_QUERY)
-    caps      = cursor.captures(tree.root_node)
+    caps      = QueryCursor(_IMPORT_QUERY).captures(tree.root_node)
     deps: set[str] = set()
     for node in caps.get("module", []):
         mod_name  = node.text.decode().split(".")[0]
@@ -175,14 +185,6 @@ def _update_dep_graph(filepath: str, tree, source: bytes) -> None:
         if os.path.exists(candidate) and candidate != filepath:
             deps.add(candidate)
     _dep_graph[filepath] = deps
-
-
-def _block_hash(block_src: str) -> str:
-    """MD5 of normalised block source (whitespace/comment agnostic)."""
-    try:
-        return hashlib.md5(ast.unparse(ast.parse(block_src)).encode()).hexdigest()
-    except SyntaxError:
-        return hashlib.md5(block_src.encode()).hexdigest()
 
 
 def _compile_block(block_src: str, filepath: str, start_row: int):
@@ -285,22 +287,39 @@ def _extract_shape(obj):
 def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     """Incremental reload driven by Tree-sitter.
 
-    Tree-sitter parses the file (tolerating syntax errors), finds build blocks,
-    and classifies non-block top-level code.  Only blocks whose source hash
-    changed are re-executed.  Blocks with a syntax error (block.has_error) keep
-    their last good actor.  Metadata-only post-block assignments are applied to
-    cached actors without re-executing the block.
+    Uses tree.edit() + old_tree.changed_ranges(new_tree) to identify exactly
+    which blocks changed.  No hashing — the parse tree IS the change detector.
+
+    Blocks with syntax errors (block.has_error) keep their last good actor.
+    Metadata-only post-block assignments update the cached actor property
+    without re-executing the block.
     """
     try:
         source = open(filepath, "rb").read()
     except OSError as exc:
         print(f"[b3d] Cannot read {filepath}: {exc}")
         cache = _file_cache.get(filepath, {})
-        return [a for _, a, _ in cache.values()]
+        return [a for a, _ in cache.values()]
 
-    old_tree = _file_trees.get(filepath)
+    old_tree   = _file_trees.get(filepath)
+    old_source = _file_sources.get(filepath, b"")
+
+    # Annotate the old tree with the edit so tree-sitter can reuse unchanged
+    # subtrees and correctly populate changed_ranges.
+    if old_tree and old_source:
+        s, oe, ne = _compute_edit(old_source, source)
+        old_tree.edit(
+            start_byte    = s,  old_end_byte    = oe,  new_end_byte    = ne,
+            start_point   = _byte_to_point(old_source, s),
+            old_end_point = _byte_to_point(old_source, oe),
+            new_end_point = _byte_to_point(source,     ne),
+        )
+
     new_tree = _ts_parser.parse(source, old_tree)
-    _file_trees[filepath] = new_tree
+    changed_ranges = old_tree.changed_ranges(new_tree) if old_tree else []
+
+    _file_trees[filepath]   = new_tree
+    _file_sources[filepath] = source
     _update_dep_graph(filepath, new_tree, source)
 
     build_blocks = _find_build_blocks(new_tree, source)
@@ -336,54 +355,51 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     for node in post_geom:
         post_refs |= _referenced_names(node) & block_var_names
 
-    # ── Execute pre-nodes (imports, constants, helpers) ──────────────────────
+    # ── Execute pre-nodes ────────────────────────────────────────────────────
     base_ns: dict = {}
     _stub_show_modules()
-    pre_src = "\n".join(pre_parts)
     try:
-        exec(compile(pre_src, filepath, "exec"), base_ns)  # noqa: S102
+        exec(compile("\n".join(pre_parts), filepath, "exec"), base_ns)  # noqa: S102
     except Exception as exc:
         print(f"[b3d] Setup error: {exc}")
         _unstub_show_modules()
         cache = _file_cache.get(filepath, {})
-        return [a for _, a, _ in cache.values()]
+        return [a for a, _ in cache.values()]
     finally:
         _unstub_show_modules()
 
     cache      = _file_cache.setdefault(filepath, {})
-    actors:    list[vtk.vtkActor]                         = []
-    new_cache: dict[str, tuple[str, vtk.vtkActor, object]] = {}
-    live_objs: dict[str, object]                          = {}
+    actors:    list[vtk.vtkActor]                = []
+    new_cache: dict[str, tuple[vtk.vtkActor, object]] = {}
+    live_objs: dict[str, object]                 = {}
 
     # ── Process build blocks ─────────────────────────────────────────────────
     for var_name, node in build_blocks:
-        # Keep last good actor for blocks with syntax errors
+        # Syntax error in this block — keep last good actor
         if node.has_error:
             if var_name in cache:
-                h, actor, obj = cache[var_name]
-                actors.append(actor)
-                new_cache[var_name] = (h, actor, obj)
+                actors.append(cache[var_name][0])
+                new_cache[var_name] = cache[var_name]
             continue
 
-        block_src  = source[node.start_byte:node.end_byte].decode()
-        h          = _block_hash(block_src)
         needs_live = var_name in post_refs
+        changed    = (not old_tree) or _block_changed(node, changed_ranges)
 
-        if not needs_live and var_name in cache and cache[var_name][0] == h:
-            _, actor, obj = cache[var_name]
+        if not needs_live and not changed and var_name in cache:
+            actor, obj = cache[var_name]
             actors.append(actor)
-            new_cache[var_name] = (h, actor, obj)
+            new_cache[var_name] = (actor, obj)
             continue
 
-        ns = dict(base_ns)
+        block_src = source[node.start_byte:node.end_byte].decode()
+        ns        = dict(base_ns)
         try:
             code = _compile_block(block_src, filepath, node.start_point[0])
             exec(code, ns)  # noqa: S102
         except Exception as exc:
             print(f"[b3d] Block '{var_name}' error: {exc}")
             if var_name in cache:
-                _, actor, obj = cache[var_name]
-                actors.append(actor)
+                actors.append(cache[var_name][0])
                 new_cache[var_name] = cache[var_name]
             continue
 
@@ -399,7 +415,7 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         try:
             actor = _shape_to_actor(shape)
             actors.append(actor)
-            new_cache[var_name] = (h, actor, obj)
+            new_cache[var_name] = (actor, obj)
         except Exception as exc:
             print(f"[b3d] Tessellation error in '{var_name}': {exc}")
 
@@ -425,11 +441,9 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
             if shape is None:
                 continue
             try:
-                block_src = source[node.start_byte:node.end_byte].decode()
-                h         = _block_hash(block_src)
-                actor     = _shape_to_actor(shape)
+                actor = _shape_to_actor(shape)
                 actors.append(actor)
-                new_cache[var_name] = (h, actor, post_ns[var_name])
+                new_cache[var_name] = (actor, post_ns[var_name])
             except Exception as exc:
                 print(f"[b3d] Tessellation error in '{var_name}': {exc}")
 
@@ -438,7 +452,7 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         entry = new_cache.get(var_name)
         if entry is None:
             continue
-        _, actor, _ = entry
+        actor, _ = entry
         try:
             value = eval(value_src, dict(base_ns))  # noqa: S307
             if attr_name == "color" and value is not None:
@@ -471,16 +485,15 @@ async def _watch_and_reload(filepaths: list[str]):
             if not changed_abs:
                 continue
 
-            # Determine which watched files need reloading
             to_reload: set[str] = set()
             for fp in filepaths:
                 fp_abs = os.path.abspath(fp)
                 if fp_abs in changed_abs:
                     to_reload.add(fp)
                 elif changed_abs & _dep_graph.get(fp_abs, set()):
-                    # A dependency changed — drop the cached tree so the next
-                    # parse has no prior state and all blocks re-hash correctly.
+                    # Drop tree so next parse has no prior state
                     _file_trees.pop(fp_abs, None)
+                    _file_sources.pop(fp_abs, None)
                     to_reload.add(fp)
 
             if not to_reload:
@@ -495,7 +508,7 @@ async def _watch_and_reload(filepaths: list[str]):
                     actors = await loop.run_in_executor(None, _load_actors, fp)
                 else:
                     cache  = _file_cache.get(fp, {})
-                    actors = [a for _, a, _ in cache.values()]
+                    actors = [a for a, _ in cache.values()]
                 all_actors.extend(actors)
 
             if not all_actors:
