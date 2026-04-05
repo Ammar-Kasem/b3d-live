@@ -938,5 +938,52 @@ def main():
         pass
 
 
+# ── stdio relay (for editors that start LSP servers as subprocesses) ──────────
+
+def lsp_relay():
+    """Relay stdin/stdout to a running b3d-live TCP LSP server.
+
+    Helix, neovim, and other editors that start language servers as subprocesses
+    communicate over stdio.  Run this as the editor's language server command and
+    point it at the TCP port opened by `b3d-live --lsp-port PORT`.
+
+    Usage:
+        b3d-lsp [--port PORT]   (default: 2087)
+    """
+    import socket
+    import threading
+
+    parser = argparse.ArgumentParser(description="Relay stdio ↔ b3d-live LSP server")
+    parser.add_argument("--port", type=int, default=2087)
+    args = parser.parse_args()
+
+    try:
+        sock = socket.create_connection(("127.0.0.1", args.port), timeout=5)
+    except (ConnectionRefusedError, TimeoutError):
+        sys.stderr.write(
+            f"[b3d-lsp] Cannot connect to 127.0.0.1:{args.port}\n"
+            f"[b3d-lsp] Start b3d-live first:  b3d-live body.py --lsp-port {args.port}\n"
+        )
+        sys.exit(1)
+
+    def _stdin_to_sock() -> None:
+        try:
+            while chunk := sys.stdin.buffer.read(4096):
+                sock.sendall(chunk)
+        except Exception:
+            pass
+        finally:
+            sock.shutdown(socket.SHUT_WR)
+
+    threading.Thread(target=_stdin_to_sock, daemon=True).start()
+
+    try:
+        while chunk := sock.recv(4096):
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     main()

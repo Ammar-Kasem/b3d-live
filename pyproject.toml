@@ -23,6 +23,7 @@ dependencies = [
 
 [project.scripts]
 b3d-live = "dev:main"
+b3d-lsp  = "dev:lsp_relay"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
