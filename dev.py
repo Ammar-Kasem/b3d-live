@@ -24,8 +24,11 @@ import argparse
 import ast
 import asyncio
 import os
+import pathlib
 import sys
+import traceback
 import types
+import urllib.parse
 
 import vtk
 from tree_sitter import Language, Parser, Query, QueryCursor
@@ -74,6 +77,10 @@ _dep_graph:    dict[str, set[str]] = {} # filepath -> set of local deps
 
 _VIEWER_FILES = {"dev.py", "viewer.py"}
 _SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
+
+# LSP state
+_file_diagnostics:   dict[str, list] = {}       # filepath -> lsprotocol Diagnostic list
+_lsp_debounce_tasks: dict[str, asyncio.Task] = {}
 
 
 # ── Tree-sitter helpers ────────────────────────────────────────────────────────
@@ -364,22 +371,26 @@ def _extract_shape(obj):
 
 # ── Core reload ───────────────────────────────────────────────────────────────
 
-def _load_actors(filepath: str) -> list[vtk.vtkActor]:
+def _load_actors(filepath: str,
+                 source: bytes | None = None) -> list[vtk.vtkActor]:
     """Incremental reload driven by Tree-sitter.
 
-    Uses tree.edit() + old_tree.changed_ranges(new_tree) to identify exactly
-    which blocks changed.  No hashing — the parse tree IS the change detector.
+    source — pre-loaded bytes (e.g. from LSP didChange).  When None the file
+    is read from disk (watchfiles path).
 
-    Blocks with syntax errors (block.has_error) keep their last good actor.
-    Metadata-only post-block assignments update the cached actor property
-    without re-executing the block.
+    Uses tree.edit() + raw byte range to identify exactly which blocks changed.
+    Collects LSP Diagnostic objects into _file_diagnostics[filepath].
     """
-    try:
-        source = open(filepath, "rb").read()
-    except OSError as exc:
-        print(f"[b3d] Cannot read {filepath}: {exc}")
-        cache = _file_cache.get(filepath, {})
-        return [a for a, _ in cache.values()]
+    diags: list = []
+    _file_diagnostics[filepath] = diags
+
+    if source is None:
+        try:
+            source = open(filepath, "rb").read()
+        except OSError as exc:
+            print(f"[b3d] Cannot read {filepath}: {exc}")
+            cache = _file_cache.get(filepath, {})
+            return [a for a, _ in cache.values()]
 
     old_tree   = _file_trees.get(filepath)
     old_source = _file_sources.get(filepath, b"")
@@ -496,6 +507,10 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     for var_name, node in build_blocks:
         # Syntax error in this block — keep last good actor
         if node.has_error:
+            diags.append(_lsp_diag(
+                node.start_point[0], node.end_point[0],
+                f"Syntax error in block '{var_name}'",
+            ))
             if var_name in cache:
                 actors.append(cache[var_name][0])
                 new_cache[var_name] = cache[var_name]
@@ -521,6 +536,8 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
             exec(code, ns)  # noqa: S102
         except Exception as exc:
             print(f"[b3d] Block '{var_name}' error: {exc}")
+            line = _exc_line(exc, filepath)
+            diags.append(_lsp_diag(line, line, f"Block '{var_name}': {exc}"))
             if var_name in cache:
                 actors.append(cache[var_name][0])
                 new_cache[var_name] = cache[var_name]
@@ -590,6 +607,113 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     return actors
 
 
+# ── LSP helpers ───────────────────────────────────────────────────────────────
+
+def _exc_line(exc: Exception, filepath: str) -> int:
+    """0-indexed line of the innermost frame that belongs to filepath."""
+    for frame in reversed(traceback.extract_tb(exc.__traceback__)):
+        if frame.filename == filepath:
+            return max(0, frame.lineno - 1)
+    return 0
+
+
+def _lsp_diag(start_line: int, end_line: int, msg: str):
+    from lsprotocol.types import Diagnostic, DiagnosticSeverity, Range, Position
+    return Diagnostic(
+        range=Range(
+            start=Position(line=start_line, character=0),
+            end=Position(line=end_line,   character=10_000),
+        ),
+        message=msg,
+        severity=DiagnosticSeverity.Error,
+        source="b3d-live",
+    )
+
+
+def _uri_to_abspath(uri: str) -> str:
+    return os.path.abspath(urllib.parse.unquote(uri.removeprefix("file://")))
+
+
+def _push_scene(all_actors: list[vtk.vtkActor], n_files: int) -> None:
+    """Replace all VTK actors and push to the browser."""
+    _renderer.RemoveAllViewProps()
+    for actor in all_actors:
+        _renderer.AddActor(actor)
+    _renderer.ResetCamera()
+    _render_window.Render()
+    if _view is not None:
+        _view.update()
+    cached = sum(len(c) for c in _file_cache.values())
+    print(f"[b3d] {len(all_actors)} shape(s), {cached} from cache")
+    if _server is not None:
+        _server.state.shape_count = len(all_actors)
+        _server.state.cache_count = cached
+        _server.state.dirty("shape_count", "cache_count")
+
+
+def _build_lsp(filepaths: list[str]) -> "LanguageServer":
+    """Create the pygls LanguageServer that drives live reload from editor events."""
+    from pygls.server import LanguageServer
+    from lsprotocol.types import (
+        TEXT_DOCUMENT_DID_OPEN, TEXT_DOCUMENT_DID_CHANGE, TEXT_DOCUMENT_DID_SAVE,
+        DidOpenTextDocumentParams, DidChangeTextDocumentParams,
+        DidSaveTextDocumentParams,
+    )
+
+    watched = {os.path.abspath(fp) for fp in filepaths}
+    _DEBOUNCE = 0.3   # seconds
+
+    b3d = LanguageServer("b3d-live", "v0.2")
+
+    async def _debounced_reload(ls, fp: str, source: bytes) -> None:
+        await asyncio.sleep(_DEBOUNCE)
+        loop = asyncio.get_running_loop()
+        actors = await loop.run_in_executor(None, _load_actors, fp, source)
+        all_actors = []
+        for p in filepaths:
+            p_abs = os.path.abspath(p)
+            if p_abs == fp:
+                all_actors.extend(actors)
+            else:
+                all_actors.extend(a for a, _ in _file_cache.get(p_abs, {}).values())
+        _push_scene(all_actors, len(filepaths))
+        uri = pathlib.Path(fp).as_uri()
+        ls.publish_diagnostics(uri, _file_diagnostics.get(fp, []))
+
+    def _trigger(ls, fp: str, source: bytes) -> None:
+        t = _lsp_debounce_tasks.get(fp)
+        if t:
+            t.cancel()
+        _lsp_debounce_tasks[fp] = asyncio.ensure_future(
+            _debounced_reload(ls, fp, source)
+        )
+
+    @b3d.feature(TEXT_DOCUMENT_DID_OPEN)
+    def did_open(ls, params: DidOpenTextDocumentParams) -> None:
+        fp = _uri_to_abspath(params.text_document.uri)
+        if fp in watched:
+            _trigger(ls, fp, params.text_document.text.encode())
+
+    @b3d.feature(TEXT_DOCUMENT_DID_CHANGE)
+    def did_change(ls, params: DidChangeTextDocumentParams) -> None:
+        fp = _uri_to_abspath(params.text_document.uri)
+        if fp in watched:
+            source = params.content_changes[-1].text.encode()
+            _trigger(ls, fp, source)
+
+    @b3d.feature(TEXT_DOCUMENT_DID_SAVE)
+    def did_save(ls, params: DidSaveTextDocumentParams) -> None:
+        fp = _uri_to_abspath(params.text_document.uri)
+        if fp in watched:
+            try:
+                source = open(fp, "rb").read()
+            except OSError:
+                return
+            _trigger(ls, fp, source)
+
+    return b3d
+
+
 # ── File watcher ──────────────────────────────────────────────────────────────
 
 async def _watch_and_reload(filepaths: list[str]):
@@ -637,20 +761,7 @@ async def _watch_and_reload(filepaths: list[str]):
             if not all_actors:
                 continue
 
-            _renderer.RemoveAllViewProps()
-            for actor in all_actors:
-                _renderer.AddActor(actor)
-            _renderer.ResetCamera()
-            _render_window.Render()
-            if _view is not None:
-                _view.update()
-
-            cached = sum(len(c) for c in _file_cache.values())
-            print(f"[b3d] {len(all_actors)} shape(s), {cached} from cache")
-            if _server is not None:
-                _server.state.shape_count = len(all_actors)
-                _server.state.cache_count = cached
-                _server.state.dirty("shape_count", "cache_count")
+            _push_scene(all_actors, len(filepaths))
     except asyncio.CancelledError:
         pass
 
@@ -782,7 +893,10 @@ def main():
     global _server
     parser = argparse.ArgumentParser()
     parser.add_argument("files", nargs="*", default=["main.py"])
-    parser.add_argument("--port", type=int, default=1234)
+    parser.add_argument("--port",     type=int, default=1234)
+    parser.add_argument("--lsp-port", type=int, default=None,
+                        help="Start LSP server on this TCP port (e.g. 2087). "
+                             "Enables live reload from editor on every keystroke.")
     args = parser.parse_args()
 
     filepaths = [os.path.abspath(f) for f in args.files]
@@ -812,6 +926,10 @@ def main():
 
     async def _run():
         asyncio.create_task(_watch_and_reload(filepaths))
+        if args.lsp_port:
+            lsp = _build_lsp(filepaths)
+            asyncio.create_task(lsp.start_tcp("127.0.0.1", args.lsp_port))
+            print(f"[b3d] LSP       : 127.0.0.1:{args.lsp_port}")
         await _server.start(exec_mode="task", open_browser=False, port=args.port)
 
     try:
