@@ -1,8 +1,10 @@
 from build123d import *
+from body import body_color
 
 
 with BuildPart() as cab:
-    cap_color = Color(0x4683CE)
+    # cap_color = Color(0x4683CE)
+    cap_color = body_color
     with BuildSketch() as cab_plan:
         RectangleRounded(16, 16, 1)
         split(bisect_by=Plane.YZ)

@@ -1,8 +1,8 @@
 from build123d import *
 
+body_color = Color(0x4683CE)
 
 with BuildPart() as body:
-    body_color = Color(0x4683CE)
     with BuildSketch() as body_skt:
         Rectangle(20, 35)
         fillet(body_skt.vertices(), 1)
