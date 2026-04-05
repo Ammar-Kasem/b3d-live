@@ -155,38 +155,60 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         return []
 
     # Classify top-level nodes
-    build_blocks: list[tuple[str, ast.With]] = []
-    import_nodes: list[ast.stmt] = []
-    post_nodes:   list[ast.stmt] = []
+    build_blocks:  list[tuple[str, ast.With]] = []
+    other_nodes:   list[ast.stmt] = []
 
     for node in tree.body:
         var = _build_var(node)
         if var:
             build_blocks.append((var, node))
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            import_nodes.append(node)
         else:
-            post_nodes.append(node)
+            other_nodes.append(node)
 
     if not build_blocks:
         return []
 
-    # Names used anywhere in post_nodes — those blocks must always run live
+    # Split other_nodes into pre (runs before blocks) and post (runs after).
+    # A node goes to post only if it references a build-block variable AND is
+    # not a bare show() call (which is stubbed and has no side effects we care
+    # about — keeping it in pre avoids forcing those blocks out of cache).
+    block_var_names = {var for var, _ in build_blocks}
+
+    def _is_show_call(node: ast.stmt) -> bool:
+        return (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "show"
+        )
+
+    pre_nodes:  list[ast.stmt] = []
+    post_nodes: list[ast.stmt] = []
+    for node in other_nodes:
+        if _is_show_call(node):
+            continue  # skip entirely — args reference block vars and would cause NameError
+        refs = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        if refs & block_var_names:
+            post_nodes.append(node)
+        else:
+            pre_nodes.append(node)
+
+    # post_refs: block vars referenced in post_nodes — must always run live
     post_refs: set[str] = {
         n.id
         for pnode in post_nodes
         for n in ast.walk(pnode)
         if isinstance(n, ast.Name)
-    }
+    } & block_var_names
 
-    # Execute imports → base_ns, stubbing known show() modules
+    # Execute pre_nodes → base_ns (imports, constants like truck_color, helpers)
     base_ns: dict = {}
     _stub_show_modules()
-    import_mod = ast.fix_missing_locations(ast.Module(body=import_nodes, type_ignores=[]))
+    pre_mod = ast.fix_missing_locations(ast.Module(body=pre_nodes, type_ignores=[]))
     try:
-        exec(compile(import_mod, filepath, "exec"), base_ns)  # noqa: S102
+        exec(compile(pre_mod, filepath, "exec"), base_ns)  # noqa: S102
     except Exception as exc:
-        print(f"[b3d] Import error: {exc}")
+        print(f"[b3d] Setup error: {exc}")
         _unstub_show_modules()
         return []
     finally:
