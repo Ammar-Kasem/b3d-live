@@ -63,8 +63,8 @@ _VIEWER_FILES = {"dev.py", "viewer.py"}
 _SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
 
 # LSP state
-_file_diagnostics:   dict[str, list] = {}       # filepath -> lsprotocol Diagnostic list
-_lsp_debounce_tasks: dict[str, asyncio.Task] = {}
+_file_diagnostics: dict[str, list] = {}   # filepath -> lsprotocol Diagnostic list
+_lsp_gen:          dict[str, int]  = {}   # filepath -> debounce generation counter
 
 
 # ── Tree-sitter helpers ────────────────────────────────────────────────────────
@@ -635,24 +635,27 @@ def _push_scene(all_actors: list, n_files: int) -> None:
         _server.state.dirty("shape_count", "cache_count")
 
 
-def _build_lsp(filepaths: list[str]):
+def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
     """Create the pygls LanguageServer that drives live reload from editor events."""
     from pygls.lsp.server import LanguageServer
     from lsprotocol.types import (
         TEXT_DOCUMENT_DID_OPEN, TEXT_DOCUMENT_DID_CHANGE, TEXT_DOCUMENT_DID_SAVE,
         DidOpenTextDocumentParams, DidChangeTextDocumentParams,
-        DidSaveTextDocumentParams,
+        DidSaveTextDocumentParams, TextDocumentSyncKind,
     )
 
     watched = {os.path.abspath(fp) for fp in filepaths}
     _DEBOUNCE = 0.3   # seconds
+    _lsp_loop: list[asyncio.AbstractEventLoop] = []  # captured on first handler call
 
-    b3d = LanguageServer("b3d-live", "v0.2")
+    b3d = LanguageServer("b3d-live", "v0.2",
+                         text_document_sync_kind=TextDocumentSyncKind.Full)
 
-    async def _debounced_reload(ls, fp: str, source: bytes) -> None:
+    async def _debounced_reload(ls, fp: str, source: bytes, gen: int) -> None:
         await asyncio.sleep(_DEBOUNCE)
-        loop = asyncio.get_running_loop()
-        actors = await loop.run_in_executor(None, _load_actors, fp, source)
+        if _lsp_gen.get(fp) != gen:   # superseded by a newer edit
+            return
+        actors = await main_loop.run_in_executor(None, _load_actors, fp, source)
         all_actors = []
         for p in filepaths:
             p_abs = os.path.abspath(p)
@@ -661,25 +664,31 @@ def _build_lsp(filepaths: list[str]):
             else:
                 all_actors.extend(a for a, _ in _file_cache.get(p_abs, {}).values())
         _push_scene(all_actors, len(filepaths))
+        # publish_diagnostics must run on the pygls event loop, not main_loop
         uri = pathlib.Path(fp).as_uri()
-        ls.publish_diagnostics(uri, _file_diagnostics.get(fp, []))
+        diags = _file_diagnostics.get(fp, [])
+        if _lsp_loop:
+            _lsp_loop[0].call_soon_threadsafe(ls.publish_diagnostics, uri, diags)
 
     def _trigger(ls, fp: str, source: bytes) -> None:
-        t = _lsp_debounce_tasks.get(fp)
-        if t:
-            t.cancel()
-        _lsp_debounce_tasks[fp] = asyncio.ensure_future(
-            _debounced_reload(ls, fp, source)
+        gen = _lsp_gen.get(fp, 0) + 1
+        _lsp_gen[fp] = gen
+        asyncio.run_coroutine_threadsafe(
+            _debounced_reload(ls, fp, source, gen), main_loop
         )
 
     @b3d.feature(TEXT_DOCUMENT_DID_OPEN)
     def did_open(ls, params: DidOpenTextDocumentParams) -> None:
+        if not _lsp_loop:
+            _lsp_loop.append(asyncio.get_running_loop())
         fp = _uri_to_abspath(params.text_document.uri)
         if fp in watched:
             _trigger(ls, fp, params.text_document.text.encode())
 
     @b3d.feature(TEXT_DOCUMENT_DID_CHANGE)
     def did_change(ls, params: DidChangeTextDocumentParams) -> None:
+        if not _lsp_loop:
+            _lsp_loop.append(asyncio.get_running_loop())
         fp = _uri_to_abspath(params.text_document.uri)
         if fp in watched:
             source = params.content_changes[-1].text.encode()
@@ -687,6 +696,8 @@ def _build_lsp(filepaths: list[str]):
 
     @b3d.feature(TEXT_DOCUMENT_DID_SAVE)
     def did_save(ls, params: DidSaveTextDocumentParams) -> None:
+        if not _lsp_loop:
+            _lsp_loop.append(asyncio.get_running_loop())
         fp = _uri_to_abspath(params.text_document.uri)
         if fp in watched:
             try:
@@ -940,8 +951,19 @@ def main():
     async def _run():
         asyncio.create_task(_watch_and_reload(filepaths))
         if args.lsp_port:
-            lsp = _build_lsp(filepaths)
-            asyncio.create_task(lsp.start_tcp("127.0.0.1", args.lsp_port))
+            import time as _time
+            main_loop = asyncio.get_running_loop()
+            def _lsp_thread():
+                while True:
+                    try:
+                        _build_lsp(filepaths, main_loop).start_tcp(
+                            "127.0.0.1", args.lsp_port
+                        )
+                    except Exception:
+                        traceback.print_exc()
+                    _time.sleep(0.5)
+
+            threading.Thread(target=_lsp_thread, daemon=True).start()
             print(f"[b3d] LSP       : 127.0.0.1:{args.lsp_port}")
         await _server.start(exec_mode="task", open_browser=False, port=args.port)
 
@@ -970,11 +992,19 @@ def lsp_relay():
     parser.add_argument("--port", type=int, default=2087)
     args = parser.parse_args()
 
-    try:
-        sock = socket.create_connection(("127.0.0.1", args.port), timeout=5)
-    except (ConnectionRefusedError, TimeoutError):
+    import time
+    _RETRY_SECS = 30
+    sock = None
+    deadline = time.monotonic() + _RETRY_SECS
+    while time.monotonic() < deadline:
+        try:
+            sock = socket.create_connection(("127.0.0.1", args.port), timeout=1)
+            break
+        except (ConnectionRefusedError, TimeoutError, OSError):
+            time.sleep(1)
+    if sock is None:
         sys.stderr.write(
-            f"[b3d-lsp] Cannot connect to 127.0.0.1:{args.port}\n"
+            f"[b3d-lsp] Cannot connect to 127.0.0.1:{args.port} after {_RETRY_SECS}s\n"
             f"[b3d-lsp] Start b3d-live first:  b3d-live body.py --lsp-port {args.port}\n"
         )
         sys.exit(1)
@@ -996,6 +1026,8 @@ def lsp_relay():
             sys.stdout.buffer.flush()
     except Exception:
         pass
+    finally:
+        os._exit(0)  # skip interpreter cleanup — daemon stdin thread holds buffered lock
 
 
 if __name__ == "__main__":
