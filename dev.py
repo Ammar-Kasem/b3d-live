@@ -973,6 +973,108 @@ def main():
         pass
 
 
+# ── Combined viewer + stdio LSP (editor-as-launcher mode) ────────────────────
+
+def lsp_main():
+    """Self-contained entry point: starts the viewer AND serves LSP on stdio.
+
+    The editor runs this as its language server.  No separate b3d-live process
+    needed — the viewer opens automatically in the browser.
+
+    Helix config example:
+        [language-server.b3d-live]
+        command = "/path/to/.venv/bin/b3d-lsp"
+        args    = ["body.py", "cab.py"]
+    """
+    global _server
+    global vtk, awatch, Change, get_server, SinglePageLayout, vuetify3, vtklocal
+    global Language, Parser, Query, QueryCursor
+    global _PY_LANGUAGE, _ts_parser, _BUILD_BLOCK_QUERY, _IMPORT_QUERY
+
+    # Steal the real stdout before anything can pollute it — LSP uses raw bytes
+    # on stdout.  All print() calls from here on go to stderr (editor log).
+    _lsp_out   = sys.stdout.buffer
+    sys.stdout = sys.stderr
+
+    import vtk
+    from tree_sitter import Language, Parser, Query, QueryCursor
+    import tree_sitter_python
+    from trame.app import get_server
+    from trame.ui.vuetify3 import SinglePageLayout
+    from trame.widgets import vuetify3, vtklocal
+    from watchfiles import awatch, Change
+
+    _PY_LANGUAGE = Language(tree_sitter_python.language())
+    _ts_parser   = Parser(_PY_LANGUAGE)
+    _BUILD_BLOCK_QUERY = Query(_PY_LANGUAGE, """
+(with_statement
+  (with_clause
+    (with_item
+      (as_pattern
+        (call (identifier) @ctx)
+        (as_pattern_target (identifier) @var))))) @block
+""")
+    _IMPORT_QUERY = Query(_PY_LANGUAGE, """
+[
+  (import_from_statement module_name: (dotted_name) @module)
+  (import_statement name: (dotted_name) @module)
+]
+""")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("files", nargs="*", default=["main.py"])
+    parser.add_argument("--port", type=int, default=1234)
+    args = parser.parse_args()
+
+    filepaths = [os.path.abspath(f) for f in args.files]
+    _server = get_server(client_type="vue3")
+
+    _setup_vtk()
+
+    all_actors: list = []
+    for filepath in filepaths:
+        all_actors.extend(_load_actors(filepath))
+    for actor in all_actors:
+        _renderer.AddActor(actor)
+    if all_actors:
+        _renderer.ResetCamera()
+        _render_window.Render()
+        print(f"[b3d] {len(all_actors)} shape(s) loaded from {len(filepaths)} file(s)")
+
+    _build_ui(_server, filepaths, initial_count=len(all_actors))
+
+    print(f"[b3d] Watching  : {', '.join(args.files)}")
+    print(f"[b3d] Browser   : http://localhost:{args.port}")
+    print(f"[b3d] LSP       : stdio")
+
+    async def _run():
+        asyncio.create_task(_watch_and_reload(filepaths))
+        main_loop = asyncio.get_running_loop()
+
+        def _lsp_thread():
+            try:
+                _build_lsp(filepaths, main_loop).start_io(
+                    stdin=sys.stdin.buffer, stdout=_lsp_out
+                )
+            except Exception:
+                traceback.print_exc()
+
+        threading.Thread(target=_lsp_thread, daemon=True).start()
+
+        def _open_browser():
+            import time, webbrowser
+            time.sleep(2)
+            webbrowser.open(f"http://localhost:{args.port}")
+        threading.Thread(target=_open_browser, daemon=True).start()
+
+        await _server.start(exec_mode="task", open_browser=False, port=args.port)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+
+
 # ── stdio relay (for editors that start LSP servers as subprocesses) ──────────
 
 def lsp_relay():
