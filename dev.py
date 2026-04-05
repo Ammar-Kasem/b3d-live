@@ -644,7 +644,8 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
         DidSaveTextDocumentParams, TextDocumentSyncKind,
     )
 
-    watched = {os.path.abspath(fp) for fp in filepaths}
+    # mutable: grows as the editor opens new .py files
+    watched: set[str] = {os.path.abspath(fp) for fp in filepaths}
     _DEBOUNCE = 0.3   # seconds
     _lsp_loop: list[asyncio.AbstractEventLoop] = []  # captured on first handler call
 
@@ -657,13 +658,12 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
             return
         actors = await main_loop.run_in_executor(None, _load_actors, fp, source)
         all_actors = []
-        for p in filepaths:
-            p_abs = os.path.abspath(p)
+        for p_abs in list(watched):
             if p_abs == fp:
                 all_actors.extend(actors)
             else:
                 all_actors.extend(a for a, _ in _file_cache.get(p_abs, {}).values())
-        _push_scene(all_actors, len(filepaths))
+        _push_scene(all_actors, len(watched))
         # publish_diagnostics must run on the pygls event loop, not main_loop
         uri = pathlib.Path(fp).as_uri()
         diags = _file_diagnostics.get(fp, [])
@@ -682,6 +682,8 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
         if not _lsp_loop:
             _lsp_loop.append(asyncio.get_running_loop())
         fp = _uri_to_abspath(params.text_document.uri)
+        if fp.endswith(".py") and os.path.basename(fp) not in _VIEWER_FILES:
+            watched.add(fp)   # auto-watch any .py file the editor opens
         if fp in watched:
             _trigger(ls, fp, params.text_document.text.encode())
 
@@ -1022,7 +1024,7 @@ def lsp_main():
 """)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("files", nargs="*", default=["main.py"])
+    parser.add_argument("files", nargs="*", default=[])
     parser.add_argument("--port", type=int, default=1234)
     args = parser.parse_args()
 
@@ -1043,12 +1045,14 @@ def lsp_main():
 
     _build_ui(_server, filepaths, initial_count=len(all_actors))
 
-    print(f"[b3d] Watching  : {', '.join(args.files)}")
+    watching = ', '.join(args.files) if args.files else "any .py file opened in editor"
+    print(f"[b3d] Watching  : {watching}")
     print(f"[b3d] Browser   : http://localhost:{args.port}")
     print(f"[b3d] LSP       : stdio")
 
     async def _run():
-        asyncio.create_task(_watch_and_reload(filepaths))
+        if filepaths:
+            asyncio.create_task(_watch_and_reload(filepaths))
         main_loop = asyncio.get_running_loop()
 
         def _lsp_thread():
