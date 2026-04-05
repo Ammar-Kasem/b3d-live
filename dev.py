@@ -651,9 +651,9 @@ def _push_scene(all_actors: list[vtk.vtkActor], n_files: int) -> None:
         _server.state.dirty("shape_count", "cache_count")
 
 
-def _build_lsp(filepaths: list[str]) -> "LanguageServer":
+def _build_lsp(filepaths: list[str]):
     """Create the pygls LanguageServer that drives live reload from editor events."""
-    from pygls.server import LanguageServer
+    from pygls.lsp.server import LanguageServer
     from lsprotocol.types import (
         TEXT_DOCUMENT_DID_OPEN, TEXT_DOCUMENT_DID_CHANGE, TEXT_DOCUMENT_DID_SAVE,
         DidOpenTextDocumentParams, DidChangeTextDocumentParams,
