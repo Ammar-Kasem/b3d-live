@@ -20,6 +20,8 @@ blocks whose byte range overlaps the changed region are re-executed.  No
 hashing required.
 """
 
+from __future__ import annotations
+
 import argparse
 import ast
 import asyncio
@@ -27,50 +29,32 @@ import os
 import pathlib
 import sys
 import traceback
+import threading
 import types
 import urllib.parse
 
-import vtk
-from tree_sitter import Language, Parser, Query, QueryCursor
-import tree_sitter_python
-from trame.app import get_server
-from trame.ui.vuetify3 import SinglePageLayout
-from trame.widgets import vuetify3, vtklocal
-from watchfiles import awatch, Change
+# Heavy deps (vtk, trame, tree-sitter, watchfiles) are imported inside main()
+# so that `b3d-lsp` starts instantly without loading the viewer stack.
 
-# ── Tree-sitter setup ──────────────────────────────────────────────────────────
-_PY_LANGUAGE = Language(tree_sitter_python.language())
-_ts_parser   = Parser(_PY_LANGUAGE)
-
-_BUILD_BLOCK_QUERY = Query(_PY_LANGUAGE, """
-(with_statement
-  (with_clause
-    (with_item
-      (as_pattern
-        (call (identifier) @ctx)
-        (as_pattern_target (identifier) @var))))) @block
-""")
-
-_IMPORT_QUERY = Query(_PY_LANGUAGE, """
-[
-  (import_from_statement module_name: (dotted_name) @module)
-  (import_statement name: (dotted_name) @module)
-]
-""")
+# ── Tree-sitter globals (set by main()) ───────────────────────────────────────
+_PY_LANGUAGE       = None
+_ts_parser         = None
+_BUILD_BLOCK_QUERY = None
+_IMPORT_QUERY      = None
 
 _BUILD_CTXS = {"BuildPart", "BuildSketch", "BuildLine"}
 _META_PROPS = {"part", "sketch"}
 _META_ATTRS = {"color", "label", "name"}
 
 # ── VTK / trame globals ────────────────────────────────────────────────────────
-_renderer:      vtk.vtkRenderer | None = None
-_render_window: vtk.vtkRenderWindow | None = None
-_view   = None
-_server = None
+_renderer      = None
+_render_window = None
+_view          = None
+_server        = None
 
 # ── Per-file state ─────────────────────────────────────────────────────────────
 # filepath -> {var_name -> (vtkActor, build123d_obj)}
-_file_cache:   dict[str, dict[str, tuple[vtk.vtkActor, object]]] = {}
+_file_cache:   dict = {}
 _file_trees:   dict[str, object] = {}   # filepath -> Tree-sitter Tree
 _file_sources: dict[str, bytes]  = {}   # filepath -> last parsed source bytes
 _dep_graph:    dict[str, set[str]] = {} # filepath -> set of local deps
@@ -372,7 +356,7 @@ def _extract_shape(obj):
 # ── Core reload ───────────────────────────────────────────────────────────────
 
 def _load_actors(filepath: str,
-                 source: bytes | None = None) -> list[vtk.vtkActor]:
+                 source: bytes | None = None) -> list:
     """Incremental reload driven by Tree-sitter.
 
     source — pre-loaded bytes (e.g. from LSP didChange).  When None the file
@@ -499,8 +483,8 @@ def _load_actors(filepath: str,
         _unstub_show_modules()
 
     cache      = _file_cache.setdefault(filepath, {})
-    actors:    list[vtk.vtkActor]                = []
-    new_cache: dict[str, tuple[vtk.vtkActor, object]] = {}
+    actors:    list                = []
+    new_cache: dict[str, tuple] = {}
     live_objs: dict[str, object]                 = {}
 
     # ── Process build blocks ─────────────────────────────────────────────────
@@ -634,7 +618,7 @@ def _uri_to_abspath(uri: str) -> str:
     return os.path.abspath(urllib.parse.unquote(uri.removeprefix("file://")))
 
 
-def _push_scene(all_actors: list[vtk.vtkActor], n_files: int) -> None:
+def _push_scene(all_actors: list, n_files: int) -> None:
     """Replace all VTK actors and push to the browser."""
     _renderer.RemoveAllViewProps()
     for actor in all_actors:
@@ -749,7 +733,7 @@ async def _watch_and_reload(filepaths: list[str]):
             for p in changed_abs:
                 _invalidate_local_modules(os.path.dirname(p))
 
-            all_actors: list[vtk.vtkActor] = []
+            all_actors: list = []
             for fp in filepaths:
                 if fp in to_reload:
                     actors = await loop.run_in_executor(None, _load_actors, fp)
@@ -891,6 +875,35 @@ def _build_ui(server, filepaths, initial_count=0):
 
 def main():
     global _server
+    global vtk, awatch, Change, get_server, SinglePageLayout, vuetify3, vtklocal
+    global Language, Parser, Query, QueryCursor
+    global _PY_LANGUAGE, _ts_parser, _BUILD_BLOCK_QUERY, _IMPORT_QUERY
+
+    import vtk
+    from tree_sitter import Language, Parser, Query, QueryCursor
+    import tree_sitter_python
+    from trame.app import get_server
+    from trame.ui.vuetify3 import SinglePageLayout
+    from trame.widgets import vuetify3, vtklocal
+    from watchfiles import awatch, Change
+
+    _PY_LANGUAGE = Language(tree_sitter_python.language())
+    _ts_parser   = Parser(_PY_LANGUAGE)
+    _BUILD_BLOCK_QUERY = Query(_PY_LANGUAGE, """
+(with_statement
+  (with_clause
+    (with_item
+      (as_pattern
+        (call (identifier) @ctx)
+        (as_pattern_target (identifier) @var))))) @block
+""")
+    _IMPORT_QUERY = Query(_PY_LANGUAGE, """
+[
+  (import_from_statement module_name: (dotted_name) @module)
+  (import_statement name: (dotted_name) @module)
+]
+""")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("files", nargs="*", default=["main.py"])
     parser.add_argument("--port",     type=int, default=1234)
@@ -904,7 +917,7 @@ def main():
 
     _setup_vtk()
 
-    all_actors: list[vtk.vtkActor] = []
+    all_actors: list = []
     for filepath in filepaths:
         all_actors.extend(_load_actors(filepath))
     for actor in all_actors:
