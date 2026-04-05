@@ -242,6 +242,9 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
             exec(compile(mod, filepath, "exec"), ns)  # noqa: S102
         except Exception as exc:
             print(f"[b3d] Block '{var_name}' error: {exc}")
+            if i in cache:
+                actors.append(cache[i][1])
+                new_cache[i] = cache[i]
             continue
 
         obj = ns.get(var_name)
