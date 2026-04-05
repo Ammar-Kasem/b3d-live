@@ -1,4 +1,24 @@
-"""Live build123d viewer — VTK WASM via trame-vtklocal, no server-side GL."""
+"""Live build123d viewer — VTK WASM via trame-vtklocal, no server-side GL.
+
+Tree-sitter is used for all parsing, giving three advantages over Python's
+built-in ast module:
+
+  1. Block-level error isolation — if one build block has a syntax error,
+     tree-sitter still finds and re-runs the other blocks normally.  With
+     ast.parse() a single error aborts the whole file.
+
+  2. Metadata-only post-block classification — assignments like
+     `body.part.color = Color(...)` are detected as metadata-only and applied
+     to the cached actor without forcing the block to re-execute.
+
+  3. Cross-file dependency graph — import statements are queried to build a
+     reverse dep graph.  When a helper module changes, only the watched files
+     that actually import it are reloaded.
+
+Change detection uses MD5 of the normalised block source (same as before),
+since tree-sitter's has_changes flag requires tree.edit() calls that are not
+yet plumbed in at this layer.
+"""
 
 import argparse
 import ast
@@ -9,46 +29,172 @@ import sys
 import types
 
 import vtk
+from tree_sitter import Language, Parser, Query, QueryCursor
+import tree_sitter_python
 from trame.app import get_server
 from trame.ui.vuetify3 import SinglePageLayout
 from trame.widgets import vuetify3, vtklocal
 from watchfiles import awatch, Change
 
-_renderer: vtk.vtkRenderer | None = None
-_render_window: vtk.vtkRenderWindow | None = None
-_view = None
-_server = None
+# ── Tree-sitter setup ──────────────────────────────────────────────────────────
+_PY_LANGUAGE = Language(tree_sitter_python.language())
+_ts_parser   = Parser(_PY_LANGUAGE)
 
-# filepath -> {block_index -> (source_hash, vtkActor)}
-_file_cache: dict[str, dict[int, tuple[str, vtk.vtkActor]]] = {}
+# In tree-sitter-python ≥ 0.23 the with_item uses as_pattern instead of
+# separate value:/alias: fields.
+_BUILD_BLOCK_QUERY = Query(_PY_LANGUAGE, """
+(with_statement
+  (with_clause
+    (with_item
+      (as_pattern
+        (call (identifier) @ctx)
+        (as_pattern_target (identifier) @var))))) @block
+""")
 
-# .py files belonging to the viewer itself — never trigger a CAD reload
-_VIEWER_FILES = {"dev.py", "viewer.py"}
-
+_IMPORT_QUERY = Query(_PY_LANGUAGE, """
+[
+  (import_from_statement module_name: (dotted_name) @module)
+  (import_statement name: (dotted_name) @module)
+]
+""")
 
 _BUILD_CTXS = {"BuildPart", "BuildSketch", "BuildLine"}
+_META_PROPS = {"part", "sketch"}
+_META_ATTRS = {"color", "label", "name"}
+
+# ── VTK / trame globals ────────────────────────────────────────────────────────
+_renderer:      vtk.vtkRenderer | None = None
+_render_window: vtk.vtkRenderWindow | None = None
+_view   = None
+_server = None
+
+# ── Per-file state ─────────────────────────────────────────────────────────────
+# filepath -> {var_name -> (source_hash, vtkActor, build123d_obj)}
+_file_cache: dict[str, dict[str, tuple[str, vtk.vtkActor, object]]] = {}
+
+# filepath -> Tree-sitter Tree
+_file_trees: dict[str, object] = {}
+
+# filepath -> set of local filepaths it imports
+_dep_graph: dict[str, set[str]] = {}
+
+_VIEWER_FILES = {"dev.py", "viewer.py"}
+_SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
 
 
-def _build_var(node: ast.stmt) -> str | None:
-    """Return the 'as' variable name if node is a top-level with BuildPart/Sketch/Line,
-    otherwise None."""
-    if not isinstance(node, ast.With):
+# ── Tree-sitter helpers ────────────────────────────────────────────────────────
+
+def _find_build_blocks(tree, source: bytes) -> list[tuple[str, object]]:
+    """Return [(var_name, node)] for every top-level build context block."""
+    result  = []
+    cursor  = QueryCursor(_BUILD_BLOCK_QUERY)
+    matches = cursor.matches(tree.root_node)
+    for _, caps in matches:
+        ctx_nodes   = caps.get("ctx",   [])
+        var_nodes   = caps.get("var",   [])
+        block_nodes = caps.get("block", [])
+        if not (ctx_nodes and var_nodes and block_nodes):
+            continue
+        ctx_node   = ctx_nodes[0]
+        var_node   = var_nodes[0]
+        block_node = block_nodes[0]
+        if ctx_node.text.decode() not in _BUILD_CTXS:
+            continue
+        if block_node.parent is None or block_node.parent.type != "module":
+            continue
+        result.append((var_node.text.decode(), block_node))
+    return result
+
+
+def _referenced_names(node) -> set[str]:
+    """Recursively collect all identifier text values in a node's subtree."""
+    names: set[str] = set()
+
+    def _walk(n):
+        if n.type == "identifier":
+            names.add(n.text.decode())
+        for child in n.children:
+            _walk(child)
+
+    _walk(node)
+    return names
+
+
+def _is_show_call_node(node) -> bool:
+    if node.type != "expression_statement":
+        return False
+    call = node.children[0] if node.children else None
+    if not call or call.type != "call":
+        return False
+    func = call.child_by_field_name("function")
+    return func is not None and func.text.decode() == "show"
+
+
+def _parse_metadata_stmt(node, source: bytes) -> tuple[str, str, str] | None:
+    """If node is `var.(part|sketch).(color|label|name) = expr`,
+    return (var_name, attr_name, value_src).  Otherwise None."""
+    # Top-level assignments are wrapped in expression_statement in the module
+    if node.type == "expression_statement" and node.children:
+        node = node.children[0]
+    if node.type != "assignment":
         return None
-    for item in node.items:
-        call = item.context_expr
-        if (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Name)
-            and call.func.id in _BUILD_CTXS
-            and isinstance(item.optional_vars, ast.Name)
-        ):
-            return item.optional_vars.id
-    return None
+    left  = node.child_by_field_name("left")
+    right = node.child_by_field_name("right")
+    if not left or not right or left.type != "attribute":
+        return None
+    attr_node = left.child_by_field_name("attribute")
+    obj_node  = left.child_by_field_name("object")
+    if not attr_node or not obj_node:
+        return None
+    if attr_node.text.decode() not in _META_ATTRS:
+        return None
+    if obj_node.type != "attribute":
+        return None
+    prop_node = obj_node.child_by_field_name("attribute")
+    var_node  = obj_node.child_by_field_name("object")
+    if not prop_node or not var_node:
+        return None
+    if prop_node.text.decode() not in _META_PROPS:
+        return None
+    return (
+        var_node.text.decode(),
+        attr_node.text.decode(),
+        source[right.start_byte:right.end_byte].decode(),
+    )
 
+
+def _update_dep_graph(filepath: str, tree, source: bytes) -> None:
+    """Rebuild the dependency entry for filepath from its import statements."""
+    local_dir = os.path.dirname(filepath)
+    cursor    = QueryCursor(_IMPORT_QUERY)
+    caps      = cursor.captures(tree.root_node)
+    deps: set[str] = set()
+    for node in caps.get("module", []):
+        mod_name  = node.text.decode().split(".")[0]
+        candidate = os.path.abspath(os.path.join(local_dir, mod_name + ".py"))
+        if os.path.exists(candidate) and candidate != filepath:
+            deps.add(candidate)
+    _dep_graph[filepath] = deps
+
+
+def _block_hash(block_src: str) -> str:
+    """MD5 of normalised block source (whitespace/comment agnostic)."""
+    try:
+        return hashlib.md5(ast.unparse(ast.parse(block_src)).encode()).hexdigest()
+    except SyntaxError:
+        return hashlib.md5(block_src.encode()).hexdigest()
+
+
+def _compile_block(block_src: str, filepath: str, start_row: int):
+    """Compile block source with correct file line numbers for error messages."""
+    tree = ast.parse(block_src)
+    ast.increment_lineno(tree, start_row)
+    return compile(tree, filepath, "exec")
+
+
+# ── VTK helpers ───────────────────────────────────────────────────────────────
 
 def _invalidate_local_modules(dirpath: str) -> None:
-    """Remove modules loaded from dirpath from sys.modules so they are
-    re-imported fresh on the next exec."""
     dirpath = os.path.abspath(dirpath)
     for name in list(sys.modules):
         f = getattr(sys.modules[name], "__file__", None)
@@ -110,12 +256,9 @@ def _shape_to_actor(shape) -> vtk.vtkActor:
     return actor
 
 
-_SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
-
-
 def _stub_show_modules():
     for name in _SHOW_MODULES:
-        fake = types.ModuleType(name)
+        fake      = types.ModuleType(name)
         fake.show = lambda *a, **k: None
         sys.modules[name] = fake
 
@@ -137,120 +280,117 @@ def _extract_shape(obj):
     return None
 
 
+# ── Core reload ───────────────────────────────────────────────────────────────
+
 def _load_actors(filepath: str) -> list[vtk.vtkActor]:
-    """Parse the file with ast, find every top-level with BuildPart/Sketch/Line block,
-    and re-execute only those whose source hash changed.
+    """Incremental reload driven by Tree-sitter.
 
-    Top-level code that is not a build block (imports, joint connections, show calls)
-    is split into:
-      - import_nodes  : run first to populate base_ns
-      - post_nodes    : run after all build blocks with all block vars in scope
-
-    Build blocks referenced in post_nodes (e.g. for joint connections) are always
-    re-executed so live objects are available; their actors are re-tessellated after
-    post_nodes run to pick up any location changes.
+    Tree-sitter parses the file (tolerating syntax errors), finds build blocks,
+    and classifies non-block top-level code.  Only blocks whose source hash
+    changed are re-executed.  Blocks with a syntax error (block.has_error) keep
+    their last good actor.  Metadata-only post-block assignments are applied to
+    cached actors without re-executing the block.
     """
-    with open(filepath) as f:
-        src = f.read()
-
     try:
-        tree = ast.parse(src, filename=filepath)
-    except SyntaxError as exc:
-        print(f"[b3d] Syntax error: {exc}")
+        source = open(filepath, "rb").read()
+    except OSError as exc:
+        print(f"[b3d] Cannot read {filepath}: {exc}")
         cache = _file_cache.get(filepath, {})
-        return [actor for _, actor in cache.values()]
+        return [a for _, a, _ in cache.values()]
 
-    # Classify top-level nodes
-    build_blocks:  list[tuple[str, ast.With]] = []
-    other_nodes:   list[ast.stmt] = []
+    old_tree = _file_trees.get(filepath)
+    new_tree = _ts_parser.parse(source, old_tree)
+    _file_trees[filepath] = new_tree
+    _update_dep_graph(filepath, new_tree, source)
 
-    for node in tree.body:
-        var = _build_var(node)
-        if var:
-            build_blocks.append((var, node))
-        else:
-            other_nodes.append(node)
-
+    build_blocks = _find_build_blocks(new_tree, source)
     if not build_blocks:
         return []
 
-    # Split other_nodes into pre (runs before blocks) and post (runs after).
-    # A node goes to post only if it references a build-block variable AND is
-    # not a bare show() call (which is stubbed and has no side effects we care
-    # about — keeping it in pre avoids forcing those blocks out of cache).
     block_var_names = {var for var, _ in build_blocks}
+    block_ranges    = {(n.start_byte, n.end_byte) for _, n in build_blocks}
 
-    def _is_show_call(node: ast.stmt) -> bool:
-        return (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "show"
-        )
+    # ── Classify top-level non-block statements ──────────────────────────────
+    pre_parts: list[str]                  = []
+    post_geom: list[object]               = []
+    post_meta: list[tuple[str, str, str]] = []
 
-    pre_nodes:  list[ast.stmt] = []
-    post_nodes: list[ast.stmt] = []
-    for node in other_nodes:
-        if _is_show_call(node):
-            continue  # skip entirely — args reference block vars and would cause NameError
-        refs = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-        if refs & block_var_names:
-            post_nodes.append(node)
+    for child in new_tree.root_node.children:
+        if child.type in ("comment", "newline"):
+            continue
+        if (child.start_byte, child.end_byte) in block_ranges:
+            continue
+        if _is_show_call_node(child):
+            continue
+        refs = _referenced_names(child) & block_var_names
+        if not refs:
+            pre_parts.append(source[child.start_byte:child.end_byte].decode())
+            continue
+        meta = _parse_metadata_stmt(child, source)
+        if meta and meta[0] in block_var_names:
+            post_meta.append(meta)
         else:
-            pre_nodes.append(node)
+            post_geom.append(child)
 
-    # post_refs: block vars referenced in post_nodes — must always run live
-    post_refs: set[str] = {
-        n.id
-        for pnode in post_nodes
-        for n in ast.walk(pnode)
-        if isinstance(n, ast.Name)
-    } & block_var_names
+    post_refs: set[str] = set()
+    for node in post_geom:
+        post_refs |= _referenced_names(node) & block_var_names
 
-    # Execute pre_nodes → base_ns (imports, constants like truck_color, helpers)
+    # ── Execute pre-nodes (imports, constants, helpers) ──────────────────────
     base_ns: dict = {}
     _stub_show_modules()
-    pre_mod = ast.fix_missing_locations(ast.Module(body=pre_nodes, type_ignores=[]))
+    pre_src = "\n".join(pre_parts)
     try:
-        exec(compile(pre_mod, filepath, "exec"), base_ns)  # noqa: S102
+        exec(compile(pre_src, filepath, "exec"), base_ns)  # noqa: S102
     except Exception as exc:
         print(f"[b3d] Setup error: {exc}")
         _unstub_show_modules()
-        return []
+        cache = _file_cache.get(filepath, {})
+        return [a for _, a, _ in cache.values()]
     finally:
         _unstub_show_modules()
 
-    cache     = _file_cache.setdefault(filepath, {})
-    actors:    list[vtk.vtkActor] = []
-    new_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
-    live_objs: dict[str, object] = {}  # var_name -> live BuildPart (for post_nodes)
+    cache      = _file_cache.setdefault(filepath, {})
+    actors:    list[vtk.vtkActor]                         = []
+    new_cache: dict[str, tuple[str, vtk.vtkActor, object]] = {}
+    live_objs: dict[str, object]                          = {}
 
-    for i, (var_name, node) in enumerate(build_blocks):
-        h   = hashlib.md5(ast.unparse(node).encode()).hexdigest()
-        mod = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
-
-        needs_live = var_name in post_refs
-
-        if not needs_live and i in cache and cache[i][0] == h:
-            actors.append(cache[i][1])
-            new_cache[i] = cache[i]
+    # ── Process build blocks ─────────────────────────────────────────────────
+    for var_name, node in build_blocks:
+        # Keep last good actor for blocks with syntax errors
+        if node.has_error:
+            if var_name in cache:
+                h, actor, obj = cache[var_name]
+                actors.append(actor)
+                new_cache[var_name] = (h, actor, obj)
             continue
 
-        # Execute the block
+        block_src  = source[node.start_byte:node.end_byte].decode()
+        h          = _block_hash(block_src)
+        needs_live = var_name in post_refs
+
+        if not needs_live and var_name in cache and cache[var_name][0] == h:
+            _, actor, obj = cache[var_name]
+            actors.append(actor)
+            new_cache[var_name] = (h, actor, obj)
+            continue
+
         ns = dict(base_ns)
         try:
-            exec(compile(mod, filepath, "exec"), ns)  # noqa: S102
+            code = _compile_block(block_src, filepath, node.start_point[0])
+            exec(code, ns)  # noqa: S102
         except Exception as exc:
             print(f"[b3d] Block '{var_name}' error: {exc}")
-            if i in cache:
-                actors.append(cache[i][1])
-                new_cache[i] = cache[i]
+            if var_name in cache:
+                _, actor, obj = cache[var_name]
+                actors.append(actor)
+                new_cache[var_name] = cache[var_name]
             continue
 
         obj = ns.get(var_name)
         if needs_live:
             live_objs[var_name] = obj
-            continue  # tessellate after post_nodes
+            continue
 
         shape = _extract_shape(obj)
         if shape is None:
@@ -259,42 +399,61 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         try:
             actor = _shape_to_actor(shape)
             actors.append(actor)
-            new_cache[i] = (h, actor)
+            new_cache[var_name] = (h, actor, obj)
         except Exception as exc:
             print(f"[b3d] Tessellation error in '{var_name}': {exc}")
 
-    # Run post-build code (joint connections, etc.) with all live objects in scope
-    if post_nodes and live_objs:
-        post_ns = {**base_ns, **live_objs}
-        post_mod = ast.fix_missing_locations(ast.Module(body=post_nodes, type_ignores=[]))
+    # ── Run geometry-affecting post-nodes with live objects ──────────────────
+    if post_geom and live_objs:
+        post_ns  = {**base_ns, **live_objs}
+        post_src = "\n".join(
+            source[n.start_byte:n.end_byte].decode() for n in post_geom
+        )
         _stub_show_modules()
         try:
-            exec(compile(post_mod, filepath, "exec"), post_ns)  # noqa: S102
+            exec(compile(post_src, filepath, "exec"), post_ns)  # noqa: S102
         except Exception as exc:
             if not isinstance(exc, NameError):
                 print(f"[b3d] Post-build error: {exc}")
         finally:
             _unstub_show_modules()
 
-        # Re-tessellate post_refs blocks — joint connections may have moved them
-        for i, (var_name, node) in enumerate(build_blocks):
+        for var_name, node in build_blocks:
             if var_name not in live_objs:
                 continue
-            h     = hashlib.md5(ast.unparse(node).encode()).hexdigest()
             shape = _extract_shape(post_ns.get(var_name))
             if shape is None:
                 continue
             try:
-                actor = _shape_to_actor(shape)
+                block_src = source[node.start_byte:node.end_byte].decode()
+                h         = _block_hash(block_src)
+                actor     = _shape_to_actor(shape)
                 actors.append(actor)
-                new_cache[i] = (h, actor)
+                new_cache[var_name] = (h, actor, post_ns[var_name])
             except Exception as exc:
                 print(f"[b3d] Tessellation error in '{var_name}': {exc}")
+
+    # ── Apply metadata-only updates to cached actors ─────────────────────────
+    for var_name, attr_name, value_src in post_meta:
+        entry = new_cache.get(var_name)
+        if entry is None:
+            continue
+        _, actor, _ = entry
+        try:
+            value = eval(value_src, dict(base_ns))  # noqa: S307
+            if attr_name == "color" and value is not None:
+                r, g, b, a = value.to_tuple()
+                actor.GetProperty().SetColor(r, g, b)
+                actor.GetProperty().SetOpacity(a)
+        except Exception as exc:
+            print(f"[b3d] Metadata '{var_name}.{attr_name}': {exc}")
 
     cache.clear()
     cache.update(new_cache)
     return actors
 
+
+# ── File watcher ──────────────────────────────────────────────────────────────
 
 async def _watch_and_reload(filepaths: list[str]):
     loop = asyncio.get_running_loop()
@@ -302,22 +461,43 @@ async def _watch_and_reload(filepaths: list[str]):
 
     try:
         async for changes in awatch(*dirs):
-            changed = {
-                os.path.basename(p)
+            changed_abs = {
+                os.path.abspath(p)
                 for c, p in changes
-                if c in (Change.modified, Change.added) and p.endswith(".py")
+                if c in (Change.modified, Change.added)
+                and p.endswith(".py")
+                and os.path.basename(p) not in _VIEWER_FILES
             }
-            if not (changed - _VIEWER_FILES):
+            if not changed_abs:
                 continue
 
-            for d in dirs:
-                _invalidate_local_modules(d)
+            # Determine which watched files need reloading
+            to_reload: set[str] = set()
+            for fp in filepaths:
+                fp_abs = os.path.abspath(fp)
+                if fp_abs in changed_abs:
+                    to_reload.add(fp)
+                elif changed_abs & _dep_graph.get(fp_abs, set()):
+                    # A dependency changed — drop the cached tree so the next
+                    # parse has no prior state and all blocks re-hash correctly.
+                    _file_trees.pop(fp_abs, None)
+                    to_reload.add(fp)
+
+            if not to_reload:
+                continue
+
+            for p in changed_abs:
+                _invalidate_local_modules(os.path.dirname(p))
 
             all_actors: list[vtk.vtkActor] = []
-            for filepath in filepaths:
-                all_actors.extend(
-                    await loop.run_in_executor(None, _load_actors, filepath)
-                )
+            for fp in filepaths:
+                if fp in to_reload:
+                    actors = await loop.run_in_executor(None, _load_actors, fp)
+                else:
+                    cache  = _file_cache.get(fp, {})
+                    actors = [a for _, a, _ in cache.values()]
+                all_actors.extend(actors)
+
             if not all_actors:
                 continue
 
@@ -328,6 +508,7 @@ async def _watch_and_reload(filepaths: list[str]):
             _render_window.Render()
             if _view is not None:
                 _view.update()
+
             cached = sum(len(c) for c in _file_cache.values())
             print(f"[b3d] {len(all_actors)} shape(s), {cached} from cache")
             if _server is not None:
@@ -338,17 +519,23 @@ async def _watch_and_reload(filepaths: list[str]):
         pass
 
 
+# ── Axis snap ─────────────────────────────────────────────────────────────────
+
 def _set_axis_view(direction, up):
     bounds = _renderer.ComputeVisiblePropBounds()
     if bounds[0] > bounds[1]:
-        return  # no visible props
-    cx = (bounds[0] + bounds[1]) / 2
-    cy = (bounds[2] + bounds[3]) / 2
-    cz = (bounds[4] + bounds[5]) / 2
+        return
+    cx   = (bounds[0] + bounds[1]) / 2
+    cy   = (bounds[2] + bounds[3]) / 2
+    cz   = (bounds[4] + bounds[5]) / 2
     dist = max(bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4]) * 2.5
     camera = _renderer.GetActiveCamera()
     camera.SetFocalPoint(cx, cy, cz)
-    camera.SetPosition(cx + direction[0]*dist, cy + direction[1]*dist, cz + direction[2]*dist)
+    camera.SetPosition(
+        cx + direction[0]*dist,
+        cy + direction[1]*dist,
+        cz + direction[2]*dist,
+    )
     camera.SetViewUp(*up)
     _renderer.ResetCamera()
     _render_window.Render()
@@ -356,15 +543,17 @@ def _set_axis_view(direction, up):
         _view.update(push_camera=True)
 
 
+# ── UI ────────────────────────────────────────────────────────────────────────
+
 def _build_ui(server, filepaths, initial_count=0):
     global _view
     state, ctrl = server.state, server.controller
 
     state.shape_count = initial_count
     state.cache_count = 0
-    state.wireframe = False
-    state.dark_bg = True
-    state.filenames = "  |  ".join(os.path.basename(fp) for fp in filepaths)
+    state.wireframe   = False
+    state.dark_bg     = True
+    state.filenames   = "  |  ".join(os.path.basename(fp) for fp in filepaths)
 
     def reset_camera():
         if _view is not None:
@@ -411,7 +600,6 @@ def _build_ui(server, filepaths, initial_count=0):
         with layout.toolbar as tb:
             tb.density = "compact"
 
-            # ── centre: all action buttons ──────────────────────────────
             vuetify3.VSpacer()
             vuetify3.VBtn(
                 icon="mdi-vector-square", title="Wireframe",
@@ -435,7 +623,6 @@ def _build_ui(server, filepaths, initial_count=0):
             )
             vuetify3.VSpacer()
 
-            # ── right: live counters + filename ─────────────────────────
             vuetify3.VChip(
                 "{{ shape_count }} shapes · {{ cache_count }} cached",
                 size="x-small", color="primary", variant="tonal", classes="mr-2",
@@ -453,6 +640,8 @@ def _build_ui(server, filepaths, initial_count=0):
                 )
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def main():
     global _server
     parser = argparse.ArgumentParser()
@@ -461,7 +650,7 @@ def main():
     args = parser.parse_args()
 
     filepaths = [os.path.abspath(f) for f in args.files]
-    _server = get_server(client_type="vue3")
+    _server   = get_server(client_type="vue3")
 
     _setup_vtk()
 
