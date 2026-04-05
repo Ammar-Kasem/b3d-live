@@ -105,9 +105,46 @@ def _shape_to_actor(shape) -> vtk.vtkActor:
     return actor
 
 
+_SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
+
+
+def _stub_show_modules():
+    for name in _SHOW_MODULES:
+        fake = types.ModuleType(name)
+        fake.show = lambda *a, **k: None
+        sys.modules[name] = fake
+
+
+def _unstub_show_modules():
+    for name in _SHOW_MODULES:
+        sys.modules.pop(name, None)
+
+
+def _extract_shape(obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "wrapped"):
+        return obj
+    if hasattr(obj, "part") and obj.part:
+        return obj.part
+    if hasattr(obj, "sketch") and obj.sketch:
+        return obj.sketch
+    return None
+
+
 def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     """Parse the file with ast, find every top-level with BuildPart/Sketch/Line block,
-    and re-execute only those whose source hash changed.  No # %% markers needed."""
+    and re-execute only those whose source hash changed.
+
+    Top-level code that is not a build block (imports, joint connections, show calls)
+    is split into:
+      - import_nodes  : run first to populate base_ns
+      - post_nodes    : run after all build blocks with all block vars in scope
+
+    Build blocks referenced in post_nodes (e.g. for joint connections) are always
+    re-executed so live objects are available; their actors are re-tessellated after
+    post_nodes run to pick up any location changes.
+    """
     with open(filepath) as f:
         src = f.read()
 
@@ -117,73 +154,111 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         print(f"[b3d] Syntax error: {exc}")
         return []
 
-    # Split top-level nodes into build blocks and setup code
+    # Classify top-level nodes
     build_blocks: list[tuple[str, ast.With]] = []
-    setup_nodes:  list[ast.stmt] = []
+    import_nodes: list[ast.stmt] = []
+    post_nodes:   list[ast.stmt] = []
+
     for node in tree.body:
         var = _build_var(node)
         if var:
             build_blocks.append((var, node))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_nodes.append(node)
         else:
-            setup_nodes.append(node)
+            post_nodes.append(node)
 
     if not build_blocks:
         return []
 
-    # Execute setup (imports, helpers) to build base namespace; stub viewer.show
+    # Names used anywhere in post_nodes — those blocks must always run live
+    post_refs: set[str] = {
+        n.id
+        for pnode in post_nodes
+        for n in ast.walk(pnode)
+        if isinstance(n, ast.Name)
+    }
+
+    # Execute imports → base_ns, stubbing known show() modules
     base_ns: dict = {}
-    fake = types.ModuleType("viewer")
-    fake.show = lambda *a, **k: None
-    sys.modules["viewer"] = fake
-    setup_mod = ast.fix_missing_locations(ast.Module(body=setup_nodes, type_ignores=[]))
+    _stub_show_modules()
+    import_mod = ast.fix_missing_locations(ast.Module(body=import_nodes, type_ignores=[]))
     try:
-        exec(compile(setup_mod, filepath, "exec"), base_ns)  # noqa: S102
+        exec(compile(import_mod, filepath, "exec"), base_ns)  # noqa: S102
     except Exception as exc:
-        if not isinstance(exc, NameError):
-            print(f"[b3d] Setup error: {exc}")
+        print(f"[b3d] Import error: {exc}")
+        _unstub_show_modules()
+        return []
     finally:
-        sys.modules.pop("viewer", None)
+        _unstub_show_modules()
 
     cache     = _file_cache.setdefault(filepath, {})
     actors:    list[vtk.vtkActor] = []
     new_cache: dict[int, tuple[str, vtk.vtkActor]] = {}
+    live_objs: dict[str, object] = {}  # var_name -> live BuildPart (for post_nodes)
 
     for i, (var_name, node) in enumerate(build_blocks):
-        h = hashlib.md5(ast.unparse(node).encode()).hexdigest()
+        h   = hashlib.md5(ast.unparse(node).encode()).hexdigest()
+        mod = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
 
-        if i in cache and cache[i][0] == h:
+        needs_live = var_name in post_refs
+
+        if not needs_live and i in cache and cache[i][0] == h:
             actors.append(cache[i][1])
             new_cache[i] = cache[i]
             continue
 
+        # Execute the block
         ns = dict(base_ns)
-        block_mod = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
         try:
-            exec(compile(block_mod, filepath, "exec"), ns)  # noqa: S102
+            exec(compile(mod, filepath, "exec"), ns)  # noqa: S102
         except Exception as exc:
             print(f"[b3d] Block '{var_name}' error: {exc}")
             continue
 
         obj = ns.get(var_name)
-        shape = None
-        if obj is not None:
-            if hasattr(obj, "wrapped"):
-                shape = obj
-            elif hasattr(obj, "part") and obj.part:
-                shape = obj.part
-            elif hasattr(obj, "sketch") and obj.sketch:
-                shape = obj.sketch
+        if needs_live:
+            live_objs[var_name] = obj
+            continue  # tessellate after post_nodes
 
+        shape = _extract_shape(obj)
         if shape is None:
             print(f"[b3d] Block '{var_name}': no shape captured")
             continue
-
         try:
             actor = _shape_to_actor(shape)
             actors.append(actor)
             new_cache[i] = (h, actor)
         except Exception as exc:
             print(f"[b3d] Tessellation error in '{var_name}': {exc}")
+
+    # Run post-build code (joint connections, etc.) with all live objects in scope
+    if post_nodes and live_objs:
+        post_ns = {**base_ns, **live_objs}
+        post_mod = ast.fix_missing_locations(ast.Module(body=post_nodes, type_ignores=[]))
+        _stub_show_modules()
+        try:
+            exec(compile(post_mod, filepath, "exec"), post_ns)  # noqa: S102
+        except Exception as exc:
+            if not isinstance(exc, NameError):
+                print(f"[b3d] Post-build error: {exc}")
+        finally:
+            _unstub_show_modules()
+
+        # Re-tessellate post_refs blocks — joint connections may have moved them
+        for i, (var_name, node) in enumerate(build_blocks):
+            if var_name not in live_objs:
+                continue
+            h     = hashlib.md5(ast.unparse(node).encode()).hexdigest()
+            shape = _extract_shape(post_ns.get(var_name))
+            if shape is None:
+                continue
+            try:
+                actor = _shape_to_actor(shape)
+                actors.append(actor)
+                new_cache[i] = (h, actor)
+            except Exception as exc:
+                print(f"[b3d] Tessellation error in '{var_name}': {exc}")
 
     cache.clear()
     cache.update(new_cache)
