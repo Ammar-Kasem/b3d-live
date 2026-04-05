@@ -1,8 +1,7 @@
 # b3d-live
 
 A live-reloading browser viewer for [build123d](https://github.com/gumyr/build123d) CAD scripts.
-Edits to your `.py` files appear in the browser instantly — only the parts that actually changed
-are re-built.
+Save a `.py` file and only the blocks that actually changed rebuild — everything else stays cached.
 
 ---
 
@@ -31,34 +30,40 @@ The browser opens automatically at `http://localhost:1234`.
 Most live viewers re-execute the entire script on every save. For complex models this means
 waiting for all geometry to rebuild even when only one part changed.
 
-b3d-live avoids this with **AST-based incremental reloading**:
+b3d-live uses **Tree-sitter incremental parsing** to sync the parse tree directly with the
+VTK scene graph:
 
-1. On each file save, the script is parsed with Python's `ast` module.
+1. On each save, Tree-sitter re-parses only the bytes that changed.
 2. Every top-level `with BuildPart() as x:`, `with BuildSketch() as x:`, and
-   `with BuildLine() as x:` block is treated as an independent unit.
-3. Each block's source is normalised (`ast.unparse`) and hashed (MD5).
-4. Only blocks whose hash changed since the last reload are re-executed.
-   All other blocks reuse their cached VTK actor — no geometry rebuild, no tessellation.
-5. Top-level code outside build blocks is split into:
-   - **pre-nodes** — imports and constants, run before any block executes
-   - **post-nodes** — code that references block variables (joint connections,
-     color assignments), run after all blocks with live objects in scope
+   `with BuildLine() as x:` block is an independent unit mapped 1:1 to a VTK actor.
+3. The raw byte edit region is compared against each block's byte span — only overlapping
+   blocks are re-executed. No hashing, no full-file diffing.
+4. Pre-part variables defined above a block (e.g. `body_color = Color(0x4683CE)`) are
+   tracked by name. When one changes, only blocks that actually reference it re-execute.
+5. Top-level metadata assignments (`body.part.color = Color(...)`) update the cached actor
+   property directly without re-executing the block.
 
-Rendering is handled entirely client-side via **VTK.wasm** (through
+```
+Tree-sitter node (BuildPart body) ←── 1:1 ──► vtkActor
+       byte range unchanged                    actor reused, nothing runs
+       byte range changed                      re-execute block, replace actor
+```
+
+Rendering runs entirely client-side via **VTK.wasm** (through
 [trame-vtklocal](https://github.com/Kitware/trame-vtklocal)). The Python server
-tessellates geometry and pushes a VTK render window state to the browser; no
-server-side OpenGL is required.
+tessellates geometry and pushes a VTK render window state to the browser — no
+server-side OpenGL required.
 
 ---
 
 ## Resilience
 
-The viewer is designed to stay usable while you are mid-edit:
+The viewer stays usable while you are mid-edit:
 
-- **Syntax errors** — `ast.parse()` fails but the last good actors are kept on screen.
-  The error is printed to the terminal.
-- **Runtime errors** — if a single block fails to execute, its last good actor is
-  preserved. Other blocks are unaffected and continue to reload normally.
+- **Syntax errors** — Tree-sitter produces a partial tree even for broken syntax. Only the
+  block containing the error loses its actor; all other blocks continue reloading normally.
+- **Runtime errors** — if a single block fails to execute, its last good actor is preserved.
+  Other blocks are unaffected.
 
 ---
 
@@ -87,142 +92,78 @@ b3d-live body.py cab.py wheels.py
 
 Changes to one file do not invalidate the cache of the others.
 
+### Shared constants across files
+
+Pre-part variables can be shared via normal imports:
+
+```python
+# common.py
+body_color = Color(0x4683CE)
+
+# body.py
+from common import body_color
+
+with BuildPart() as body:
+    ...
+    body.part.color = body_color
+```
+
+When `common.py` changes, b3d-live's dependency graph identifies which watched files
+import it and reloads only those — and within each file, only the blocks that reference
+the changed variable.
+
 ---
 
-## How it compares to other viewers
+## How it compares
 
 |                      | b3d-live                  | ocp-vscode      | cq-editor       | YACV                |
 | -------------------- | ------------------------- | --------------- | --------------- | ------------------- |
 | Editor coupling      | none — any editor         | VS Code only    | built-in editor | none                |
 | Reload unit          | changed block only        | whole file      | whole file      | whole file          |
+| Change detection     | Tree-sitter byte range    | file hash       | file hash       | file hash           |
 | Rendering            | VTK.wasm in browser       | embedded window | PyQT window     | OCP.wasm in browser |
 | Multi-file watch     | yes                       | no              | no              | no                  |
-| Error resilience     | last good state preserved | blanks on error | blanks on error | blanks on error     |
+| Cross-file deps      | yes                       | no              | no              | no                  |
+| Error resilience     | per-block, last good kept | blanks on error | blanks on error | blanks on error     |
 | Static deployment    | no                        | no              | no              | yes                 |
-| Browser playground   | no                        | no              | no              | yes                 |
 | Face/edge inspection | no                        | yes             | yes             | yes                 |
-
-**The key differentiator** is block-level incremental reload. A truck model with a body,
-cab, and four wheels means only the block you edited rebuilds — the other five stay cached.
-For heavy geometry this is the difference between a 200 ms feedback loop and a 10 s wait.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Python process (dev.py)                        │
-│                                                  │
-│  watchfiles ──► AST parse                       │
-│                    │                             │
-│              classify blocks                     │
-│                    │                             │
-│         ┌──── hash match? ────┐                 │
-│         │ yes                 │ no               │
-│      reuse actor         exec block             │
-│                               │                  │
-│                          tessellate              │
-│                               │                  │
-│                         vtkActor                 │
-│                               │                  │
-│              trame-vtklocal push                 │
-└──────────────────┬──────────────────────────────┘
-                   │  WebSocket
-┌──────────────────▼──────────────────────────────┐
-│  Browser                                        │
-│  VTK.wasm renders vtkRenderWindow mirror        │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  Python process (dev.py)                            │
+│                                                     │
+│  watchfiles ──► Tree-sitter incremental parse       │
+│                       │                             │
+│               classify blocks                       │
+│                       │                             │
+│   ┌─────── byte range overlap? ───────┐             │
+│   │ no                                │ yes         │
+│ reuse actor                      exec block         │
+│                                        │            │
+│                                   tessellate        │
+│                                        │            │
+│                                   vtkActor          │
+│                                        │            │
+│                    trame-vtklocal push              │
+└──────────────────────┬──────────────────────────────┘
+                       │  WebSocket
+┌──────────────────────▼──────────────────────────────┐
+│  Browser                                            │
+│  VTK.wasm renders vtkRenderWindow mirror            │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Roadmap
 
-### Tree-sitter integration
-
-The current `ast`-based approach has three limitations that Tree-sitter addresses cleanly.
-
-**The core idea: sync the Tree-sitter graph with the VTK scene graph**
-
-Python's `ast` module has no incremental state — it re-parses the entire file from scratch
-on every save, then the viewer re-hashes every block to find what changed. Tree-sitter's
-incremental parser tracks exactly which nodes changed via a `has_changes` flag. This means
-the MD5 hash cache can be replaced by a direct 1:1 mapping between Tree-sitter nodes and
-VTK actors:
-
-```
-Tree-sitter node (BuildPart body) ←── 1:1 ──► vtkActor
-       has_changes = True                      invalidate + re-execute
-       has_changes = False                     untouched, no hash needed
-```
-
-Scene graph operations become direct consequences of parse tree changes:
-
-| Tree-sitter event | VTK scene action |
-|-------------------|-----------------|
-| Node added | Create actor, add to scene |
-| Node removed | Remove actor from scene |
-| Node edited (`has_changes`) | Re-execute block, replace actor |
-| Node unchanged | Actor stays, nothing runs |
-
-**1. Syntax error granularity**
-Currently when `ast.parse()` fails the entire file falls back to its last good state.
-Tree-sitter can parse broken syntax and still produce a partial tree, so only the block
-containing the error loses its actor — all other blocks continue reloading normally.
-
-**2. Post-node classification**
-Any top-level statement that references a block variable currently forces that block to
-re-execute on every save, bypassing the cache:
-
-```python
-with BuildPart() as body:
-    ...
-
-body.part.color = Color(0x4683CE)  # currently forces body to re-execute every time
-```
-
-Tree-sitter queries can distinguish metadata-only statements (color, label) from
-geometry-affecting ones (joint connections, transforms), so only the latter invalidate
-the cache:
-
-```scheme
-; metadata-only: does not need live re-execution
-(assignment
-  left: (attribute
-    object: (identifier) @var
-    attribute: (identifier) @attr (#match? @attr "color|label|name")))
-```
-
-**3. Cross-file dependency tracking**
-When any file in the project is saved, the current watcher invalidates all local modules
-and re-runs every watched file. With Tree-sitter maintaining a project-wide parse state,
-import statements are queried to build a reverse dependency graph:
-
-```scheme
-(import_from_statement module_name: (dotted_name) @module)
-(import_statement name: (dotted_name) @module)
-```
-
-When `common.py` changes, Tree-sitter can identify exactly which blocks in dependent files
-reference the changed definitions — not just which files need re-running. The VTK scene
-gets surgical updates: only the actors whose source actually changed are replaced.
-watchfiles keeps its one job (detecting the save event); Tree-sitter handles parse, diff,
-dependency traversal, and block identification in a single incremental pass.
-
-### Simulation support
-
-The architecture is intentionally kept close to VTK, which is the standard toolkit for
-scientific visualisation. Adding FEM simulation output (stress fields, displacement, flow)
-would require:
-
-- Accepting VTK dataset files (`.vtu`, `.vtp`) alongside build123d scripts
-- Rendering scalar/vector fields with colormaps and scalar bars
-- Deformed shape overlay
-
-The geometry pipeline (build123d → BREP) is kept separate from the mesh pipeline
-intentionally, so FEM meshers (Gmsh, Netgen) can consume the BREP directly without
-re-tessellating at viewer resolution.
+- **Simulation support** — accept VTK dataset files (`.vtu`, `.vtp`) alongside build123d
+  scripts; render scalar/vector fields with colormaps; deformed shape overlay for FEM output.
+- **Face/edge inspection** — click to select and inspect topology, matching ocp-vscode.
 
 ---
 
@@ -236,6 +177,7 @@ re-tessellating at viewer resolution.
 | [trame-vtklocal](https://github.com/Kitware/trame-vtklocal) | VTK.wasm bridge                   |
 | [trame-vuetify](https://github.com/Kitware/trame-vuetify)   | Vuetify 3 UI components           |
 | [watchfiles](https://github.com/samuelcolvin/watchfiles)    | Cross-platform file watcher       |
+| [tree-sitter](https://tree-sitter.github.io/)               | Incremental parser for change detection |
 
 ---
 
@@ -244,39 +186,40 @@ re-tessellating at viewer resolution.
 ### Project structure
 
 ```
-dev.py        main viewer — watcher, AST parser, VTK pipeline, trame UI
-body.py       example: truck body
-cab.py        example: truck cab
+dev.py          main viewer — watcher, Tree-sitter parser, VTK pipeline, trame UI
+test_dev.py     unit tests for the parsing layer (no VTK or build123d required)
+body.py         example: truck body
+cab.py          example: truck cab
 pyproject.toml
+```
+
+### Running tests
+
+```bash
+uv sync --extra dev
+uv run pytest test_dev.py
 ```
 
 ### Key functions in dev.py
 
-| Function                       | Purpose                                                                     |
-| ------------------------------ | --------------------------------------------------------------------------- |
-| `_build_var(node)`             | Returns the `as` variable name if a node is a top-level build context block |
-| `_load_actors(filepath)`       | Core reload function — parses, classifies, diffs, executes, tessellates     |
-| `_shape_to_actor(shape)`       | Tessellates a build123d Shape into a vtkActor                               |
-| `_watch_and_reload(filepaths)` | Async loop — watches files, calls `_load_actors`, pushes to browser         |
-| `_build_ui(server, filepaths)` | Constructs the trame/Vuetify toolbar and VTK view                           |
-
-### Running locally
-
-```bash
-git clone ...
-cd build123d
-uv sync
-uv run b3d-live body.py
-```
+| Function                       | Purpose                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| `_compute_edit(old, new)`      | Find the changed byte region between two source versions                |
+| `_find_build_blocks(tree, src)`| Return all top-level build context blocks from a Tree-sitter parse tree |
+| `_block_changed(node, ranges)` | Check if a block's byte range overlaps the changed region               |
+| `_defined_names(node)`         | Names bound by a top-level statement; None for unknowable forms         |
+| `_load_actors(filepath)`       | Core reload — parse, diff, exec changed blocks, tessellate              |
+| `_shape_to_actor(shape)`       | Tessellate a build123d Shape into a vtkActor                            |
+| `_watch_and_reload(filepaths)` | Async watcher loop — detects saves, calls `_load_actors`, updates scene |
+| `_build_ui(server, filepaths)` | Constructs the trame/Vuetify toolbar and VTK view                       |
 
 ### Adding a new toolbar button
 
-All UI is in `_build_ui()` in `dev.py`. Buttons use Vuetify 3 `VBtn` and controller
-callbacks wired via `server.controller`:
+All UI is in `_build_ui()`. Buttons use Vuetify 3 `VBtn` wired via `server.controller`:
 
 ```python
 ctrl.my_action = lambda: do_something()
 vuetify3.VBtn(icon="mdi-icon-name", click=ctrl.my_action, **_btn)
 ```
 
-MDI icon names: https://pictogrammers.com/library/mdi/ — for example `mdi-file-cad`.
+MDI icon names: https://pictogrammers.com/library/mdi/
