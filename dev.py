@@ -98,6 +98,86 @@ def _byte_to_point(src: bytes, offset: int) -> tuple[int, int]:
     return (row, offset - (last_nl + 1))
 
 
+class _ByteRange:
+    """Minimal range object used for raw-byte change detection."""
+    __slots__ = ("start_byte", "end_byte")
+    def __init__(self, start_byte: int, end_byte: int):
+        self.start_byte = start_byte
+        self.end_byte   = end_byte
+
+
+def _defined_names(node) -> set[str] | None:
+    """Return names defined by a top-level statement, or None if unknowable.
+
+    None means the statement could bind an unpredictable set of names (e.g.
+    star imports), so callers must treat every name as potentially changed.
+
+    Handles:
+      x = expr                    → {"x"}
+      x += expr                   → {"x"}
+      from mod import a, b as c   → {"a", "c"}
+      from mod import *           → None
+      import foo, bar as b        → {"foo", "b"}
+      def f(): / class C:         → {"f"} / {"C"}
+      anything else               → None  (safe fallback)
+    """
+    t = node.type
+    if t == "expression_statement" and node.children:
+        return _defined_names(node.children[0])
+
+    if t == "assignment":
+        left = node.child_by_field_name("left")
+        if left and left.type == "identifier":
+            return {left.text.decode()}
+        return None  # tuple-unpack or attribute — don't guess
+
+    if t == "augmented_assignment":
+        left = node.child_by_field_name("left")
+        if left and left.type == "identifier":
+            return {left.text.decode()}
+        return None
+
+    if t == "import_from_statement":
+        for child in node.children:
+            if child.type == "wildcard_import":
+                return None
+        module_id = (node.child_by_field_name("module_name") or object()).id
+        result: set[str] = set()
+        for child in node.children:
+            if child.type == "aliased_import":
+                alias = child.child_by_field_name("alias")
+                name  = child.child_by_field_name("name")
+                target = alias or name
+                if target:
+                    result.add(target.text.decode().split(".")[0])
+            elif child.type == "dotted_name" and child.id != module_id:
+                result.add(child.text.decode().split(".")[0])
+        return result or None
+
+    if t == "import_statement":
+        result = set()
+        for child in node.children:
+            if child.type == "aliased_import":
+                alias = child.child_by_field_name("alias")
+                name  = child.child_by_field_name("name")
+                target = alias or name
+                if target:
+                    result.add(target.text.decode().split(".")[0])
+            elif child.type == "dotted_name":
+                result.add(child.text.decode().split(".")[0])
+        return result or None
+
+    if t == "function_definition":
+        n = node.child_by_field_name("name")
+        return {n.text.decode()} if n else None
+
+    if t == "class_definition":
+        n = node.child_by_field_name("name")
+        return {n.text.decode()} if n else None
+
+    return None  # unknown — safe fallback
+
+
 def _block_changed(node, changed_ranges) -> bool:
     """True if the block's byte range overlaps any changed range."""
     for r in changed_ranges:
@@ -305,7 +385,8 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     old_source = _file_sources.get(filepath, b"")
 
     # Annotate the old tree with the edit so tree-sitter can reuse unchanged
-    # subtrees and correctly populate changed_ranges.
+    # subtrees during incremental parsing.
+    changed_ranges = []
     if old_tree and old_source:
         s, oe, ne = _compute_edit(old_source, source)
         old_tree.edit(
@@ -314,9 +395,14 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
             old_end_point = _byte_to_point(old_source, oe),
             new_end_point = _byte_to_point(source,     ne),
         )
+        # Use the raw byte edit region for block invalidation.
+        # tree.changed_ranges() only detects structural AST changes and misses
+        # value-only edits (e.g. changing a hex literal) where the node types
+        # and positions are identical.  The raw (s, ne) range is always correct.
+        if s != oe or s != ne:
+            changed_ranges = [_ByteRange(s, ne)]
 
-    new_tree = _ts_parser.parse(source, old_tree)
-    changed_ranges = old_tree.changed_ranges(new_tree) if old_tree else []
+    new_tree = _ts_parser.parse(source, old_tree) if old_tree else _ts_parser.parse(source)
 
     _file_trees[filepath]   = new_tree
     _file_sources[filepath] = source
@@ -333,6 +419,7 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
     pre_parts: list[str]                  = []
     post_geom: list[object]               = []
     post_meta: list[tuple[str, str, str]] = []
+    post_meta_byte_ranges: list[tuple[int, int]] = []
 
     for child in new_tree.root_node.children:
         if child.type in ("comment", "newline"):
@@ -348,12 +435,44 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         meta = _parse_metadata_stmt(child, source)
         if meta and meta[0] in block_var_names:
             post_meta.append(meta)
+            post_meta_byte_ranges.append((child.start_byte, child.end_byte))
         else:
             post_geom.append(child)
 
     post_refs: set[str] = set()
     for node in post_geom:
         post_refs |= _referenced_names(node) & block_var_names
+
+    # Determine which pre-part names changed (if any).
+    # None  → unknowable (star import, complex pattern) → re-exec all blocks.
+    # set() → no pre-part change outside blocks.
+    # {"x"} → only blocks referencing "x" need re-execution.
+    changed_pre_part_vars: set[str] | None = set()
+
+    if changed_ranges:
+        for r in changed_ranges:
+            in_block = any(
+                r.start_byte < bn.end_byte and r.end_byte > bn.start_byte
+                for _, bn in build_blocks
+            )
+            if not in_block:
+                in_meta = any(
+                    r.start_byte < me and r.end_byte > ms
+                    for ms, me in post_meta_byte_ranges
+                )
+                if not in_meta:
+                    # Find the top-level node that owns this change
+                    for child in new_tree.root_node.children:
+                        if (r.start_byte < child.end_byte
+                                and r.end_byte > child.start_byte):
+                            names = _defined_names(child)
+                            if names is None:
+                                changed_pre_part_vars = None  # fallback
+                            elif isinstance(changed_pre_part_vars, set):
+                                changed_pre_part_vars.update(names)
+                            break
+            if changed_pre_part_vars is None:
+                break
 
     # ── Execute pre-nodes ────────────────────────────────────────────────────
     base_ns: dict = {}
@@ -383,7 +502,11 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
             continue
 
         needs_live = var_name in post_refs
-        changed    = (not old_tree) or _block_changed(node, changed_ranges)
+        if changed_pre_part_vars is None:
+            pre_stale = True
+        else:
+            pre_stale = bool(_referenced_names(node) & changed_pre_part_vars)
+        changed = (not old_tree) or pre_stale or _block_changed(node, changed_ranges)
 
         if not needs_live and not changed and var_name in cache:
             actor, obj = cache[var_name]
