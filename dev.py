@@ -97,7 +97,12 @@ def _shape_to_actor(shape) -> vtk.vtkActor:
     actor = vtk.vtkActor()
     actor.SetMapper(mapper)
     prop = actor.GetProperty()
-    prop.SetColor(0.68, 0.78, 0.91)
+    if shape.color is not None:
+        r, g, b, a = shape.color.to_tuple()
+        prop.SetColor(r, g, b)
+        prop.SetOpacity(a)
+    else:
+        prop.SetColor(0.68, 0.78, 0.91)
     prop.SetAmbient(0.2)
     prop.SetDiffuse(0.8)
     prop.SetSpecular(0.3)
