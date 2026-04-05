@@ -141,29 +141,50 @@ For heavy geometry this is the difference between a 200 ms feedback loop and a 1
 
 ### Tree-sitter integration
 
-The current AST approach has two known limitations:
+The current `ast`-based approach has three limitations that Tree-sitter addresses cleanly.
+
+**The core idea: sync the Tree-sitter graph with the VTK scene graph**
+
+Python's `ast` module has no incremental state — it re-parses the entire file from scratch
+on every save, then the viewer re-hashes every block to find what changed. Tree-sitter's
+incremental parser tracks exactly which nodes changed via a `has_changes` flag. This means
+the MD5 hash cache can be replaced by a direct 1:1 mapping between Tree-sitter nodes and
+VTK actors:
+
+```
+Tree-sitter node (BuildPart body) ←── 1:1 ──► vtkActor
+       has_changes = True                      invalidate + re-execute
+       has_changes = False                     untouched, no hash needed
+```
+
+Scene graph operations become direct consequences of parse tree changes:
+
+| Tree-sitter event | VTK scene action |
+|-------------------|-----------------|
+| Node added | Create actor, add to scene |
+| Node removed | Remove actor from scene |
+| Node edited (`has_changes`) | Re-execute block, replace actor |
+| Node unchanged | Actor stays, nothing runs |
 
 **1. Syntax error granularity**
-When `ast.parse()` fails, the entire file is treated as broken and all blocks fall back
-to their last good state. With [Tree-sitter](https://tree-sitter.github.io/tree-sitter/),
-which can parse broken syntax and still produce a partial tree, it would be possible to
-identify exactly which block contains the error and keep all other blocks reloading normally.
+Currently when `ast.parse()` fails the entire file falls back to its last good state.
+Tree-sitter can parse broken syntax and still produce a partial tree, so only the block
+containing the error loses its actor — all other blocks continue reloading normally.
 
 **2. Post-node classification**
-Any top-level statement that references a block variable is currently treated as
-geometry-affecting and forces that block to re-execute on every save (bypassing the cache).
-This means:
+Any top-level statement that references a block variable currently forces that block to
+re-execute on every save, bypassing the cache:
 
 ```python
 with BuildPart() as body:
     ...
 
-body.part.color = Color(0x4683CE)  # forces body to re-execute every time
+body.part.color = Color(0x4683CE)  # currently forces body to re-execute every time
 ```
 
-Tree-sitter's query syntax makes it straightforward to distinguish metadata-only statements
-(color, label) from geometry-affecting ones (joint connections, transforms), so only the
-latter invalidate the cache:
+Tree-sitter queries can distinguish metadata-only statements (color, label) from
+geometry-affecting ones (joint connections, transforms), so only the latter invalidate
+the cache:
 
 ```scheme
 ; metadata-only: does not need live re-execution
@@ -172,6 +193,22 @@ latter invalidate the cache:
     object: (identifier) @var
     attribute: (identifier) @attr (#match? @attr "color|label|name")))
 ```
+
+**3. Cross-file dependency tracking**
+When any file in the project is saved, the current watcher invalidates all local modules
+and re-runs every watched file. With Tree-sitter maintaining a project-wide parse state,
+import statements are queried to build a reverse dependency graph:
+
+```scheme
+(import_from_statement module_name: (dotted_name) @module)
+(import_statement name: (dotted_name) @module)
+```
+
+When `common.py` changes, Tree-sitter can identify exactly which blocks in dependent files
+reference the changed definitions — not just which files need re-running. The VTK scene
+gets surgical updates: only the actors whose source actually changed are replaced.
+watchfiles keeps its one job (detecting the save event); Tree-sitter handles parse, diff,
+dependency traversal, and block identification in a single incremental pass.
 
 ### Simulation support
 
