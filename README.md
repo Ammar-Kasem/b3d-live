@@ -5,10 +5,10 @@ Save a `.py` file and only the blocks that actually changed rebuild — everythi
 
 Two launch modes:
 
-| Mode | Command | Reload trigger |
-| ---- | ------- | -------------- |
-| **File watcher** | `b3d-live body.py` | file save |
-| **Editor LSP** | `b3d-lsp body.py` | every keystroke |
+| Mode             | Command            | Reload trigger  |
+| ---------------- | ------------------ | --------------- |
+| **File watcher** | `b3d-live body.py` | file save       |
+| **Editor LSP**   | `b3d-lsp body.py`  | every keystroke |
 
 ---
 
@@ -34,7 +34,7 @@ uv run b3d-live body.py --port 8080
 ### Editor LSP mode
 
 `b3d-lsp` is a language server that starts the viewer and reloads on every keystroke — no
-manual startup required.  Point your editor at it as a language server for Python files.
+manual startup required. Point your editor at it as a language server for Python files.
 
 ```bash
 uv run b3d-lsp body.py cab.py
@@ -48,7 +48,7 @@ The browser opens automatically at `http://localhost:1234`.
 # ~/.config/helix/languages.toml
 [language-server.b3d-live]
 command = "/path/to/.venv/bin/b3d-lsp"
-args    = ["body.py", "cab.py"]
+args = ["body.py", "cab.py"]
 
 [[language]]
 name = "python"
@@ -235,16 +235,16 @@ the changed variable.
 
 ## Stack
 
-| Package                                                     | Role                              |
-| ----------------------------------------------------------- | --------------------------------- |
-| [build123d](https://github.com/gumyr/build123d)             | CAD geometry kernel (OCC wrapper) |
-| [vtk](https://vtk.org)                                      | 3D rendering pipeline             |
-| [trame](https://kitware.github.io/trame/)                   | Web application server            |
-| [trame-vtklocal](https://github.com/Kitware/trame-vtklocal) | VTK.wasm bridge                   |
-| [trame-vuetify](https://github.com/Kitware/trame-vuetify)   | Vuetify 3 UI components           |
-| [watchfiles](https://github.com/samuelcolvin/watchfiles)    | Cross-platform file watcher       |
+| Package                                                     | Role                                    |
+| ----------------------------------------------------------- | --------------------------------------- |
+| [build123d](https://github.com/gumyr/build123d)             | CAD geometry kernel (OCC wrapper)       |
+| [vtk](https://vtk.org)                                      | 3D rendering pipeline                   |
+| [trame](https://kitware.github.io/trame/)                   | Web application server                  |
+| [trame-vtklocal](https://github.com/Kitware/trame-vtklocal) | VTK.wasm bridge                         |
+| [trame-vuetify](https://github.com/Kitware/trame-vuetify)   | Vuetify 3 UI components                 |
+| [watchfiles](https://github.com/samuelcolvin/watchfiles)    | Cross-platform file watcher             |
 | [tree-sitter](https://tree-sitter.github.io/)               | Incremental parser for change detection |
-| [pygls](https://github.com/openlawlibrary/pygls)            | LSP server framework              |
+| [pygls](https://github.com/openlawlibrary/pygls)            | LSP server framework                    |
 
 ---
 
@@ -269,19 +269,19 @@ uv run pytest test_dev.py
 
 ### Key functions in dev.py
 
-| Function                       | Purpose                                                                 |
-| ------------------------------ | ----------------------------------------------------------------------- |
-| `_compute_edit(old, new)`      | Find the changed byte region between two source versions                |
-| `_find_build_blocks(tree, src)`| Return all top-level build context blocks from a Tree-sitter parse tree |
-| `_block_changed(node, ranges)` | Check if a block's byte range overlaps the changed region               |
-| `_defined_names(node)`         | Names bound by a top-level statement; None for unknowable forms         |
-| `_load_actors(filepath)`       | Core reload — parse, diff, exec changed blocks, tessellate              |
-| `_shape_to_actor(shape)`       | Tessellate a build123d Shape into a vtkActor                            |
-| `_watch_and_reload(filepaths)` | Async watcher loop — detects saves, calls `_load_actors`, updates scene |
-| `_build_lsp(filepaths, loop)`  | Build pygls LanguageServer with debounced reload handlers               |
-| `_build_ui(server, filepaths)` | Constructs the trame/Vuetify toolbar and VTK view                       |
-| `main()`                       | Entry point for `b3d-live` — file-watcher mode                         |
-| `lsp_main()`                   | Entry point for `b3d-lsp` — self-contained viewer+LSP stdio server     |
+| Function                        | Purpose                                                                 |
+| ------------------------------- | ----------------------------------------------------------------------- |
+| `_compute_edit(old, new)`       | Find the changed byte region between two source versions                |
+| `_find_build_blocks(tree, src)` | Return all top-level build context blocks from a Tree-sitter parse tree |
+| `_block_changed(node, ranges)`  | Check if a block's byte range overlaps the changed region               |
+| `_defined_names(node)`          | Names bound by a top-level statement; None for unknowable forms         |
+| `_load_actors(filepath)`        | Core reload — parse, diff, exec changed blocks, tessellate              |
+| `_shape_to_actor(shape)`        | Tessellate a build123d Shape into a vtkActor                            |
+| `_watch_and_reload(filepaths)`  | Async watcher loop — detects saves, calls `_load_actors`, updates scene |
+| `_build_lsp(filepaths, loop)`   | Build pygls LanguageServer with debounced reload handlers               |
+| `_build_ui(server, filepaths)`  | Constructs the trame/Vuetify toolbar and VTK view                       |
+| `main()`                        | Entry point for `b3d-live` — file-watcher mode                          |
+| `lsp_main()`                    | Entry point for `b3d-lsp` — self-contained viewer+LSP stdio server      |
 
 ### Adding a new toolbar button
 
