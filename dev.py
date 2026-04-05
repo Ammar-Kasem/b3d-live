@@ -157,7 +157,8 @@ def _load_actors(filepath: str) -> list[vtk.vtkActor]:
         tree = ast.parse(src, filename=filepath)
     except SyntaxError as exc:
         print(f"[b3d] Syntax error: {exc}")
-        return []
+        cache = _file_cache.get(filepath, {})
+        return [actor for _, actor in cache.values()]
 
     # Classify top-level nodes
     build_blocks:  list[tuple[str, ast.With]] = []
