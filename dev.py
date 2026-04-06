@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import logging
 import os
 import json
 import pathlib
@@ -33,6 +34,8 @@ import traceback
 import threading
 import types
 import urllib.parse
+
+logger = logging.getLogger(__name__)
 
 # Heavy deps (vtk, trame, tree-sitter, watchfiles) are imported inside main()
 # so that `b3d-lsp` starts instantly without loading the viewer stack.
@@ -323,10 +326,10 @@ def _update_dep_graph_jedi(filepath: str, source: bytes) -> None:
                             and _is_local_project_file(p)
                             and os.path.basename(p) not in _VIEWER_FILES):
                         deps.add(p)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                logger.debug("[b3d] jedi goto failed for %s: %s", filepath, exc)
+    except Exception as exc:
+        logger.debug("[b3d] jedi dep-graph failed for %s: %s", filepath, exc)
     _dep_graph[filepath] = deps
 
 
@@ -349,7 +352,8 @@ def _jedi_all_module_names(filepath: str, source: bytes) -> set[str] | None:
         return {n.name for n in script.get_names(
             all_scopes=False, definitions=True, references=False
         )}
-    except Exception:
+    except Exception as exc:
+        logger.debug("[b3d] jedi module-names failed for %s: %s", filepath, exc)
         return None
 
 
@@ -649,7 +653,6 @@ def _load_actors(filepath: str,
         exec(compile("\n".join(pre_parts), filepath, "exec"), base_ns)  # noqa: S102
     except Exception as exc:
         print(f"[b3d] Setup error: {exc}")
-        _unstub_show_modules()
         cache = _file_cache.get(filepath, {})
         return [a for a, _ in cache.values()], 0
     finally:
@@ -690,9 +693,10 @@ def _load_actors(filepath: str,
         else:
             pre_stale = bool(_referenced_names(node) & changed_pre_part_vars)
         # Also stale if any block it references was rebuilt/errored this pass
-        _cached_so_far = {n for n, s in block_statuses.items() if s == "cached"}
-        _other_deps = (_referenced_names(node) & block_var_names) - {var_name}
-        dep_stale = bool(_other_deps - _cached_so_far)
+        dep_stale = bool(
+            ((_referenced_names(node) & block_var_names) - {var_name})
+            - {n for n, s in block_statuses.items() if s == "cached"}
+        )
         changed = (not old_tree) or pre_stale or dep_stale or _block_changed(node, changed_ranges)
 
         if not needs_live and not changed and var_name in cache:
@@ -1439,10 +1443,10 @@ def _build_ui(server, filepaths, initial_count=0):
                 )
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Shared initialisation ─────────────────────────────────────────────────────
 
-def main():
-    global _server
+def _init_runtime() -> None:
+    """Import heavy deps and set up global state shared by main() and lsp_main()."""
     global vtk, awatch, Change, get_server, SinglePageLayout, vuetify3, vtklocal
     global Language, Parser, Query, QueryCursor
     global _PY_LANGUAGE, _ts_parser, _BUILD_BLOCK_QUERY, _IMPORT_QUERY
@@ -1472,21 +1476,9 @@ def main():
 ]
 """)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("files", nargs="*", default=["main.py"])
-    parser.add_argument("--port",     type=int, default=1234)
-    parser.add_argument("--lsp-port", type=int, default=None,
-                        help="Start LSP server on this TCP port (e.g. 2087). "
-                             "Enables live reload from editor on every keystroke.")
-    args = parser.parse_args()
 
-    filepaths = [os.path.abspath(f) for f in args.files]
-    workdir   = os.path.dirname(filepaths[0]) if filepaths else os.getcwd()
-    _server   = get_server(client_type="vue3")
-
-    _init_jedi(workdir)
-    _setup_vtk()
-
+def _load_initial_actors(filepaths: list[str]) -> list:
+    """Load all filepaths, add actors to the renderer, and return them."""
     all_actors: list = []
     for filepath in filepaths:
         actors, _ = _load_actors(filepath)
@@ -1497,6 +1489,32 @@ def main():
         _renderer.ResetCamera()
         _render_window.Render()
         print(f"[b3d] {len(all_actors)} shape(s) loaded from {len(filepaths)} file(s)")
+    return all_actors
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    global _server
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("files", nargs="*", default=["main.py"])
+    parser.add_argument("--port",     type=int, default=1234)
+    parser.add_argument("--lsp-port", type=int, default=None,
+                        help="Start LSP server on this TCP port (e.g. 2087). "
+                             "Enables live reload from editor on every keystroke.")
+    args = parser.parse_args()
+
+    _init_runtime()
+
+    filepaths = [os.path.abspath(f) for f in args.files]
+    workdir   = os.path.dirname(filepaths[0]) if filepaths else os.getcwd()
+    _server   = get_server(client_type="vue3")
+
+    _init_jedi(workdir)
+    _setup_vtk()
+
+    all_actors = _load_initial_actors(filepaths)
 
     _build_ui(_server, filepaths, initial_count=len(all_actors))
 
@@ -1547,39 +1565,13 @@ def lsp_main():
         args    = ["body.py", "cab.py"]
     """
     global _server
-    global vtk, awatch, Change, get_server, SinglePageLayout, vuetify3, vtklocal
-    global Language, Parser, Query, QueryCursor
-    global _PY_LANGUAGE, _ts_parser, _BUILD_BLOCK_QUERY, _IMPORT_QUERY
 
     # Steal the real stdout before anything can pollute it — LSP uses raw bytes
     # on stdout.  All print() calls from here on go to stderr (editor log).
     _lsp_out   = sys.stdout.buffer
     sys.stdout = sys.stderr
 
-    import vtk
-    from tree_sitter import Language, Parser, Query, QueryCursor
-    import tree_sitter_python
-    from trame.app import get_server
-    from trame.ui.vuetify3 import SinglePageLayout
-    from trame.widgets import vuetify3, vtklocal
-    from watchfiles import awatch, Change
-
-    _PY_LANGUAGE = Language(tree_sitter_python.language())
-    _ts_parser   = Parser(_PY_LANGUAGE)
-    _BUILD_BLOCK_QUERY = Query(_PY_LANGUAGE, """
-(with_statement
-  (with_clause
-    (with_item
-      (as_pattern
-        (call (identifier) @ctx)
-        (as_pattern_target (identifier) @var))))) @block
-""")
-    _IMPORT_QUERY = Query(_PY_LANGUAGE, """
-[
-  (import_from_statement module_name: (dotted_name) @module)
-  (import_statement name: (dotted_name) @module)
-]
-""")
+    _init_runtime()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("files", nargs="*", default=[])
@@ -1600,16 +1592,7 @@ def lsp_main():
 
     _setup_vtk()
 
-    all_actors: list = []
-    for filepath in filepaths:
-        actors, _ = _load_actors(filepath)
-        all_actors.extend(actors)
-    for actor in all_actors:
-        _renderer.AddActor(actor)
-    if all_actors:
-        _renderer.ResetCamera()
-        _render_window.Render()
-        print(f"[b3d] {len(all_actors)} shape(s) loaded from {len(filepaths)} file(s)")
+    all_actors = _load_initial_actors(filepaths)
 
     _build_ui(_server, filepaths, initial_count=len(all_actors))
 
