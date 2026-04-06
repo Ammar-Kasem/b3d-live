@@ -66,6 +66,10 @@ _SHOW_MODULES = {"viewer", "ocp_vscode", "ocp_viewer"}
 _file_diagnostics: dict[str, list] = {}   # filepath -> lsprotocol Diagnostic list
 _lsp_gen:          dict[str, int]  = {}   # filepath -> debounce generation counter
 
+# Per-block status for the UI panel
+# filepath -> {var_name -> "cached" | "rebuilt" | "error"}
+_block_status: dict[str, dict[str, str]] = {}
+
 
 # ── Tree-sitter helpers ────────────────────────────────────────────────────────
 
@@ -356,7 +360,7 @@ def _extract_shape(obj):
 # ── Core reload ───────────────────────────────────────────────────────────────
 
 def _load_actors(filepath: str,
-                 source: bytes | None = None) -> list:
+                 source: bytes | None = None) -> tuple[list, int]:
     """Incremental reload driven by Tree-sitter.
 
     source — pre-loaded bytes (e.g. from LSP didChange).  When None the file
@@ -367,6 +371,7 @@ def _load_actors(filepath: str,
     """
     diags: list = []
     _file_diagnostics[filepath] = diags
+    hits = 0
 
     if source is None:
         try:
@@ -374,7 +379,7 @@ def _load_actors(filepath: str,
         except OSError as exc:
             print(f"[b3d] Cannot read {filepath}: {exc}")
             cache = _file_cache.get(filepath, {})
-            return [a for a, _ in cache.values()]
+            return [a for a, _ in cache.values()], 0
 
     old_tree   = _file_trees.get(filepath)
     old_source = _file_sources.get(filepath, b"")
@@ -405,7 +410,7 @@ def _load_actors(filepath: str,
 
     build_blocks = _find_build_blocks(new_tree, source)
     if not build_blocks:
-        return []
+        return [], 0
 
     block_var_names = {var for var, _ in build_blocks}
     block_ranges    = {(n.start_byte, n.end_byte) for _, n in build_blocks}
@@ -478,14 +483,18 @@ def _load_actors(filepath: str,
         print(f"[b3d] Setup error: {exc}")
         _unstub_show_modules()
         cache = _file_cache.get(filepath, {})
-        return [a for a, _ in cache.values()]
+        return [a for a, _ in cache.values()], 0
     finally:
         _unstub_show_modules()
 
-    cache      = _file_cache.setdefault(filepath, {})
+    cache           = _file_cache.setdefault(filepath, {})
     actors:    list                = []
     new_cache: dict[str, tuple] = {}
     live_objs: dict[str, object]                 = {}
+    block_statuses: dict[str, str]               = {}
+    # Accumulated block objects so later blocks can reference earlier ones
+    # (e.g. cab2 referencing cab inside its own body)
+    prior_objs: dict[str, object]                = {}
 
     # ── Process build blocks ─────────────────────────────────────────────────
     for var_name, node in build_blocks:
@@ -496,8 +505,11 @@ def _load_actors(filepath: str,
                 f"Syntax error in block '{var_name}'",
             ))
             if var_name in cache:
-                actors.append(cache[var_name][0])
+                actor, obj = cache[var_name]
+                actors.append(actor)
                 new_cache[var_name] = cache[var_name]
+                prior_objs[var_name] = obj
+            block_statuses[var_name] = "error"
             continue
 
         needs_live = var_name in post_refs
@@ -505,16 +517,23 @@ def _load_actors(filepath: str,
             pre_stale = True
         else:
             pre_stale = bool(_referenced_names(node) & changed_pre_part_vars)
-        changed = (not old_tree) or pre_stale or _block_changed(node, changed_ranges)
+        # Also stale if any block it references was rebuilt/errored this pass
+        _cached_so_far = {n for n, s in block_statuses.items() if s == "cached"}
+        _other_deps = (_referenced_names(node) & block_var_names) - {var_name}
+        dep_stale = bool(_other_deps - _cached_so_far)
+        changed = (not old_tree) or pre_stale or dep_stale or _block_changed(node, changed_ranges)
 
         if not needs_live and not changed and var_name in cache:
             actor, obj = cache[var_name]
             actors.append(actor)
             new_cache[var_name] = (actor, obj)
+            prior_objs[var_name] = obj
+            block_statuses[var_name] = "cached"
+            hits += 1
             continue
 
         block_src = source[node.start_byte:node.end_byte].decode()
-        ns        = dict(base_ns)
+        ns        = {**base_ns, **prior_objs}
         try:
             code = _compile_block(block_src, filepath, node.start_point[0])
             exec(code, ns)  # noqa: S102
@@ -523,11 +542,15 @@ def _load_actors(filepath: str,
             line = _exc_line(exc, filepath)
             diags.append(_lsp_diag(line, line, f"Block '{var_name}': {exc}"))
             if var_name in cache:
-                actors.append(cache[var_name][0])
+                actor, obj = cache[var_name]
+                actors.append(actor)
                 new_cache[var_name] = cache[var_name]
+                prior_objs[var_name] = obj
+            block_statuses[var_name] = "error"
             continue
 
         obj = ns.get(var_name)
+        prior_objs[var_name] = obj
         if needs_live:
             live_objs[var_name] = obj
             continue
@@ -535,17 +558,20 @@ def _load_actors(filepath: str,
         shape = _extract_shape(obj)
         if shape is None:
             print(f"[b3d] Block '{var_name}': no shape captured")
+            block_statuses[var_name] = "error"
             continue
         try:
             actor = _shape_to_actor(shape)
             actors.append(actor)
             new_cache[var_name] = (actor, obj)
+            block_statuses[var_name] = "rebuilt"
         except Exception as exc:
             print(f"[b3d] Tessellation error in '{var_name}': {exc}")
+            block_statuses[var_name] = "error"
 
     # ── Run geometry-affecting post-nodes with live objects ──────────────────
     if post_geom and live_objs:
-        post_ns  = {**base_ns, **live_objs}
+        post_ns  = {**base_ns, **prior_objs, **live_objs}
         post_src = "\n".join(
             source[n.start_byte:n.end_byte].decode() for n in post_geom
         )
@@ -563,13 +589,16 @@ def _load_actors(filepath: str,
                 continue
             shape = _extract_shape(post_ns.get(var_name))
             if shape is None:
+                block_statuses[var_name] = "error"
                 continue
             try:
                 actor = _shape_to_actor(shape)
                 actors.append(actor)
                 new_cache[var_name] = (actor, post_ns[var_name])
+                block_statuses[var_name] = "rebuilt"
             except Exception as exc:
                 print(f"[b3d] Tessellation error in '{var_name}': {exc}")
+                block_statuses[var_name] = "error"
 
     # ── Apply metadata-only updates to cached actors ─────────────────────────
     for var_name, attr_name, value_src in post_meta:
@@ -588,7 +617,11 @@ def _load_actors(filepath: str,
 
     cache.clear()
     cache.update(new_cache)
-    return actors
+    # Fill any blocks that didn't reach a status (e.g. needs_live with no shape)
+    for var_name, _ in build_blocks:
+        block_statuses.setdefault(var_name, "error")
+    _block_status[filepath] = block_statuses
+    return actors, hits
 
 
 # ── LSP helpers ───────────────────────────────────────────────────────────────
@@ -618,7 +651,81 @@ def _uri_to_abspath(uri: str) -> str:
     return os.path.abspath(urllib.parse.unquote(uri.removeprefix("file://")))
 
 
-def _push_scene(all_actors: list, n_files: int) -> None:
+_STATUS_COLOR = {"cached": "success", "rebuilt": "primary", "error": "error"}
+
+
+def _build_ast_tree_data() -> list:
+    """Build file → block tree for VTreeview.
+
+    Each block node carries only: name, line number, status, visibility.
+    Falls back to the bare cache list on SyntaxError.
+    """
+    all_paths = dict.fromkeys(list(_file_sources.keys()) + list(_block_status.keys()))
+    groups = []
+
+    for filepath in all_paths:
+        fname    = os.path.basename(filepath)
+        source   = _file_sources.get(filepath, b"")
+        cache    = _file_cache.get(filepath, {})
+        statuses = _block_status.get(filepath, {})
+
+        blocks: list = []
+        try:
+            tree = ast.parse(source)
+            for stmt in tree.body:
+                if not isinstance(stmt, ast.With):
+                    continue
+                for item in stmt.items:
+                    if not isinstance(item.context_expr, ast.Call):
+                        continue
+                    func = item.context_expr.func
+                    ctx  = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                    if ctx not in _BUILD_CTXS:
+                        continue
+                    as_name = (item.optional_vars.id
+                               if isinstance(item.optional_vars, ast.Name) else None)
+                    if not as_name:
+                        continue
+                    status = statuses.get(as_name, "rebuilt")
+                    entry  = cache.get(as_name)
+                    blocks.append({
+                        "id":        f"{filepath}::{as_name}",
+                        "label":     f"{as_name}  · L{stmt.lineno}",
+                        "kind":      "block",
+                        "status":    status,
+                        "visible":   bool(entry[0].GetVisibility()) if entry else False,
+                        "has_actor": entry is not None,
+                        "color":     _STATUS_COLOR.get(status, "primary"),
+                        "children":  [],
+                    })
+                    break
+        except SyntaxError:
+            for var_name, (actor, _) in cache.items():
+                status = statuses.get(var_name, "rebuilt")
+                blocks.append({
+                    "id":        f"{filepath}::{var_name}",
+                    "label":     var_name,
+                    "kind":      "block",
+                    "status":    status,
+                    "visible":   bool(actor.GetVisibility()),
+                    "has_actor": True,
+                    "color":     _STATUS_COLOR.get(status, "primary"),
+                    "children":  [],
+                })
+
+        if blocks:
+            groups.append({
+                "id":       f"file::{filepath}",
+                "label":    fname,
+                "kind":     "file",
+                "color":    "",
+                "children": blocks,
+            })
+
+    return groups
+
+
+def _push_scene(all_actors: list, hits: int) -> None:
     """Replace all VTK actors and push to the browser."""
     _renderer.RemoveAllViewProps()
     for actor in all_actors:
@@ -627,12 +734,11 @@ def _push_scene(all_actors: list, n_files: int) -> None:
     _render_window.Render()
     if _view is not None:
         _view.update()
-    cached = sum(len(c) for c in _file_cache.values())
-    print(f"[b3d] {len(all_actors)} shape(s), {cached} from cache")
+    print(f"[b3d] {len(all_actors)} shape(s), {hits} cached")
     if _server is not None:
-        _server.state.shape_count = len(all_actors)
-        _server.state.cache_count = cached
-        _server.state.dirty("shape_count", "cache_count")
+        with _server.state:
+            _server.state.shape_count = len(all_actors)
+            _server.state.ast_tree    = _build_ast_tree_data()
 
 
 def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
@@ -656,14 +762,14 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
         await asyncio.sleep(_DEBOUNCE)
         if _lsp_gen.get(fp) != gen:   # superseded by a newer edit
             return
-        actors = await main_loop.run_in_executor(None, _load_actors, fp, source)
+        actors, hits = await main_loop.run_in_executor(None, _load_actors, fp, source)
         all_actors = []
         for p_abs in list(watched):
             if p_abs == fp:
                 all_actors.extend(actors)
             else:
                 all_actors.extend(a for a, _ in _file_cache.get(p_abs, {}).values())
-        _push_scene(all_actors, len(watched))
+        _push_scene(all_actors, hits)
         # publish_diagnostics must run on the pygls event loop, not main_loop
         uri = pathlib.Path(fp).as_uri()
         diags = _file_diagnostics.get(fp, [])
@@ -747,18 +853,21 @@ async def _watch_and_reload(filepaths: list[str]):
                 _invalidate_local_modules(os.path.dirname(p))
 
             all_actors: list = []
+            total_hits = 0
             for fp in filepaths:
                 if fp in to_reload:
-                    actors = await loop.run_in_executor(None, _load_actors, fp)
+                    actors, hits = await loop.run_in_executor(None, _load_actors, fp)
+                    total_hits += hits
                 else:
                     cache  = _file_cache.get(fp, {})
                     actors = [a for a, _ in cache.values()]
+                    total_hits += len(actors)
                 all_actors.extend(actors)
 
             if not all_actors:
                 continue
 
-            _push_scene(all_actors, len(filepaths))
+            _push_scene(all_actors, total_hits)
     except asyncio.CancelledError:
         pass
 
@@ -793,11 +902,15 @@ def _build_ui(server, filepaths, initial_count=0):
     global _view
     state, ctrl = server.state, server.controller
 
-    state.shape_count = initial_count
-    state.cache_count = 0
+    state.shape_count    = initial_count
+    state.ast_tree       = _build_ast_tree_data()
+    state.panel_open     = False
+    state.panel_width    = 260
+    state.activated_node = []
     state.wireframe   = False
     state.dark_bg     = True
-    state.filenames   = "  |  ".join(os.path.basename(fp) for fp in filepaths)
+    state.parallel    = False
+    state.edges       = False
 
     def reset_camera():
         if _view is not None:
@@ -828,26 +941,151 @@ def _build_ui(server, filepaths, initial_count=0):
         if _view is not None:
             _view.update()
 
+    @state.change("activated_node")
+    def _on_activate(activated_node, **kwargs):
+        if not activated_node:
+            return
+        node_id = activated_node[0]
+        # Block node ids are filepath + "::" + var_name with no further "::"
+        # Find by checking each known filepath as prefix
+        entry = None
+        for fp in _file_cache:
+            prefix = fp + "::"
+            if node_id.startswith(prefix):
+                tail = node_id[len(prefix):]
+                if "::" not in tail:          # var_name has no "::"
+                    entry = _file_cache[fp].get(tail)
+                    if entry:
+                        break
+        if entry:
+            actor, _ = entry
+            actor.SetVisibility(int(not bool(actor.GetVisibility())))
+            _render_window.Render()
+            if _view is not None:
+                _view.update()
+        with state:
+            state.activated_node = []
+            state.ast_tree       = _build_ast_tree_data()
+
+    def toggle_projection():
+        state.parallel = not state.parallel
+        cam = _renderer.GetActiveCamera()
+        if state.parallel:
+            cam.ParallelProjectionOn()
+        else:
+            cam.ParallelProjectionOff()
+        _render_window.Render()
+        if _view is not None:
+            _view.update()
+
+    def toggle_edges():
+        state.edges = not state.edges
+        col = _renderer.GetActors()
+        col.InitTraversal()
+        actor = col.GetNextActor()
+        while actor:
+            actor.GetProperty().SetEdgeVisibility(int(state.edges))
+            actor = col.GetNextActor()
+        _render_window.Render()
+        if _view is not None:
+            _view.update()
+
     ctrl.reset_camera      = reset_camera
     ctrl.toggle_wireframe  = toggle_wireframe
     ctrl.toggle_background = toggle_background
-    ctrl.view_x   = lambda: _set_axis_view(( 1,  0,  0), (0, 0, 1))
-    ctrl.view_y   = lambda: _set_axis_view(( 0, -1,  0), (0, 0, 1))
-    ctrl.view_z   = lambda: _set_axis_view(( 0,  0,  1), (0, 1, 0))
-    ctrl.view_iso = lambda: _set_axis_view(( 1, -1,  1), (0, 0, 1))
+    ctrl.toggle_projection = toggle_projection
+    ctrl.toggle_edges      = toggle_edges
+    ctrl.view_x    = lambda: _set_axis_view(( 1,  0,  0), (0, 0, 1))
+    ctrl.view_nx   = lambda: _set_axis_view((-1,  0,  0), (0, 0, 1))
+    ctrl.view_y    = lambda: _set_axis_view(( 0, -1,  0), (0, 0, 1))
+    ctrl.view_ny   = lambda: _set_axis_view(( 0,  1,  0), (0, 0, 1))
+    ctrl.view_z    = lambda: _set_axis_view(( 0,  0,  1), (0, 1, 0))
+    ctrl.view_nz   = lambda: _set_axis_view(( 0,  0, -1), (0, 1, 0))
+    ctrl.view_iso  = lambda: _set_axis_view(( 1, -1,  1), (0, 0, 1))
 
     _btn = dict(variant="text", density="compact", size="small")
 
     with SinglePageLayout(server) as layout:
         layout.title.set_text("build123d")
 
+        layout.root.add_child("""<style id="b3d-panel-styles">
+/* ── Navigation drawer: glass-morphism ── */
+.b3d-drawer {
+  background: rgba(15, 15, 20, 0.97) !important;
+  border-right: 1px solid rgba(255,255,255,0.07) !important;
+  box-shadow: 6px 0 32px rgba(0,0,0,0.5) !important;
+}
+
+/* ── File group header ── */
+.b3d-file-header {
+  letter-spacing: 0.09em !important;
+  opacity: 0.55;
+  font-size: 0.68rem !important;
+}
+
+/* ── Block items: smooth colour transitions ── */
+.b3d-item {
+  cursor: pointer;
+  transition: background-color 0.25s ease,
+              color 0.25s ease,
+              opacity 0.2s ease !important;
+}
+.b3d-item:hover {
+  background: rgba(255,255,255,0.06) !important;
+}
+
+/* ── "Rebuilt" flash on status change ── */
+@keyframes b3d-flash {
+  0%   { box-shadow: inset 0 0 0 1px rgba(var(--v-theme-primary), 0.9); }
+  100% { box-shadow: inset 0 0 0 1px transparent; }
+}
+.b3d-item-rebuilt {
+  animation: b3d-flash 0.7s ease-out;
+}
+
+/* ── Error status: subtle red left border ── */
+.b3d-item-error {
+  border-left: 2px solid rgba(var(--v-theme-error), 0.7) !important;
+}
+
+/* ── Resize handle: highlight on hover ── */
+.b3d-resize {
+  transition: background-color 0.15s ease !important;
+}
+.b3d-resize:hover {
+  background-color: rgba(255,255,255,0.18) !important;
+}
+
+/* ── Shape count header ── */
+.b3d-shape-count {
+  letter-spacing: 0.08em !important;
+  opacity: 0.8;
+}
+</style>""")
+
         with layout.toolbar as tb:
             tb.density = "compact"
 
             vuetify3.VSpacer()
+
+            # ── Display mode ─────────────────────────────────────────────────
             vuetify3.VBtn(
                 icon="mdi-vector-square", title="Wireframe",
-                click=ctrl.toggle_wireframe, **_btn,
+                click=ctrl.toggle_wireframe,
+                color=("wireframe ? 'primary' : ''",),
+                **_btn,
+            )
+            vuetify3.VBtn(
+                icon="mdi-border-all-variant", title="Show edges",
+                click=ctrl.toggle_edges,
+                color=("edges ? 'primary' : ''",),
+                **_btn,
+            )
+            vuetify3.VBtn(
+                icon="mdi-perspective-less", title="Parallel projection",
+                click=ctrl.toggle_projection,
+                color=("parallel ? 'primary' : ''",),
+                **_btn,
             )
             vuetify3.VBtn(
                 icon="mdi-theme-light-dark", title="Toggle background",
@@ -857,24 +1095,90 @@ def _build_ui(server, filepaths, initial_count=0):
                 icon="mdi-fit-to-screen", title="Reset camera",
                 click=ctrl.reset_camera, **_btn,
             )
+
             vuetify3.VDivider(vertical=True, classes="mx-2")
-            vuetify3.VBtn("X", title="View along X", click=ctrl.view_x, **_btn)
-            vuetify3.VBtn("Y", title="View along Y", click=ctrl.view_y, **_btn)
-            vuetify3.VBtn("Z", title="View along Z", click=ctrl.view_z, **_btn)
+
+            # ── Named views ──────────────────────────────────────────────────
+            vuetify3.VBtn("X",  title="Right view (+X)",  click=ctrl.view_x,  **_btn)
+            vuetify3.VBtn("-X", title="Left view (-X)",   click=ctrl.view_nx, **_btn)
+            vuetify3.VBtn("Y",  title="Front view (+Y)",  click=ctrl.view_y,  **_btn)
+            vuetify3.VBtn("-Y", title="Back view (-Y)",   click=ctrl.view_ny, **_btn)
+            vuetify3.VBtn("Z",  title="Top view (+Z)",    click=ctrl.view_z,  **_btn)
+            vuetify3.VBtn("-Z", title="Bottom view (-Z)", click=ctrl.view_nz, **_btn)
             vuetify3.VBtn(
                 icon="mdi-axis-arrow", title="Isometric",
                 click=ctrl.view_iso, **_btn,
             )
+
             vuetify3.VSpacer()
 
-            vuetify3.VChip(
-                "{{ shape_count }} shapes · {{ cache_count }} cached",
-                size="x-small", color="primary", variant="tonal", classes="mr-2",
+        # Hamburger button opens the left panel
+        layout.icon.click = "panel_open = !panel_open"
+
+        with vuetify3.VNavigationDrawer(
+            v_model=("panel_open", False),
+            location="left",
+            width=("panel_width", 260),
+            classes="b3d-drawer",
+        ):
+            # ── Drag-resize handle on the right edge ─────────────────────────
+            vuetify3.VSheet(
+                classes="b3d-resize",
+                style=(
+                    "position:absolute;right:0;top:0;bottom:0;width:5px;"
+                    "cursor:col-resize;z-index:10;"
+                ),
+                mousedown=(
+                    "(e => {"
+                    " const sx=e.clientX, sw=panel_width;"
+                    " const mv=e=>{ panel_width=Math.max(180,Math.min(600,sw+(e.clientX-sx))); };"
+                    " window.addEventListener('mousemove',mv);"
+                    " window.addEventListener('mouseup',"
+                    "  ()=>window.removeEventListener('mousemove',mv),{once:true});"
+                    "})($event)"
+                ),
             )
-            vuetify3.VChip(
-                "{{ filenames }}",
-                size="x-small", variant="outlined", classes="mr-1",
-            )
+            # ── Header ───────────────────────────────────────────────────────
+            with vuetify3.VList(density="compact"):
+                vuetify3.VListSubheader(
+                    "{{ shape_count }} shape(s)",
+                    classes="text-caption font-weight-bold text-uppercase b3d-shape-count",
+                )
+            vuetify3.VDivider()
+            # ── File groups ──────────────────────────────────────────────────
+            with vuetify3.VList(density="compact", nav=True, classes="pa-2"):
+                with vuetify3.Template(
+                    v_for="group in ast_tree",
+                    key=("group.id",),
+                ):
+                    vuetify3.VListSubheader(
+                        "{{ group.label }}",
+                        classes="text-caption font-weight-bold text-uppercase b3d-file-header mt-1",
+                    )
+                    vuetify3.VListItem(
+                        v_for="block in group.children",
+                        key=("block.id",),
+                        prepend_icon=(
+                            "block.has_actor && !block.visible ? 'mdi-eye-off-outline'"
+                            " : block.status === 'error'   ? 'mdi-alert-circle-outline'"
+                            " : block.status === 'cached'  ? 'mdi-check-circle-outline'"
+                            " : 'mdi-refresh'",
+                        ),
+                        append_icon=(
+                            "block.has_actor"
+                            " ? (block.visible ? 'mdi-eye-outline' : 'mdi-eye-off-outline')"
+                            " : ''",
+                        ),
+                        title=("block.label",),
+                        base_color=("block.color",),
+                        rounded="lg",
+                        classes=(
+                            "'mb-1 b3d-item'"
+                            " + (block.status === 'rebuilt' ? ' b3d-item-rebuilt' : '')"
+                            " + (block.status === 'error'   ? ' b3d-item-error'   : '')",
+                        ),
+                        click="activated_node = [block.id]",
+                    )
 
         with layout.content:
             with vuetify3.VContainer(fluid=True, classes="pa-0 fill-height"):
@@ -932,7 +1236,8 @@ def main():
 
     all_actors: list = []
     for filepath in filepaths:
-        all_actors.extend(_load_actors(filepath))
+        actors, _ = _load_actors(filepath)
+        all_actors.extend(actors)
     for actor in all_actors:
         _renderer.AddActor(actor)
     if all_actors:
@@ -1035,7 +1340,8 @@ def lsp_main():
 
     all_actors: list = []
     for filepath in filepaths:
-        all_actors.extend(_load_actors(filepath))
+        actors, _ = _load_actors(filepath)
+        all_actors.extend(actors)
     for actor in all_actors:
         _renderer.AddActor(actor)
     if all_actors:
