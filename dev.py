@@ -856,20 +856,8 @@ _STATUS_COLOR = {"cached": "success", "rebuilt": "primary", "error": "error"}
 
 
 def _build_ast_tree_data() -> list:
-    """Build full project file-tree for the panel.
-
-    Three tiers:
-      watched  — files that have been loaded/executed (have actors)
-      dep      — files imported by watched files (via _dep_graph)
-      project  — other .py files discovered in the project directory
-    """
+    """Build tree data for the panel — only open/watched files."""
     loaded: set[str] = set(_file_sources.keys()) | set(_block_status.keys())
-
-    all_deps: set[str] = set()
-    for fp in loaded:
-        all_deps.update(_dep_graph.get(fp, set()))
-    dep_only     = all_deps - loaded
-    project_only = {f for f in _scan_project_files() if f not in loaded and f not in dep_only}
 
     def _blocks_for(filepath: str) -> list:
         tree     = _file_trees.get(filepath)
@@ -885,44 +873,22 @@ def _build_ast_tree_data() -> list:
             blocks.append({
                 "id":        f"{filepath}::{var_name}",
                 "label":     var_name,
-                "kind":      "block",
+                "line":      node.start_point[0] + 1,  # 1-based
                 "status":    status,
                 "visible":   bool(entry[0].GetVisibility()) if entry else False,
                 "has_actor": entry is not None,
                 "color":     _STATUS_COLOR.get(status, "primary"),
-                "children":  [],
             })
         return blocks
 
-    groups: list = []
-    for fp in sorted(loaded):
-        groups.append({
-            "id":         f"file::{fp}",
-            "label":      os.path.basename(fp),
-            "role_label": "",
-            "kind":       "file",
-            "role":       "watched",
-            "children":   _blocks_for(fp),
-        })
-    for fp in sorted(dep_only):
-        groups.append({
-            "id":         f"file::{fp}",
-            "label":      os.path.basename(fp),
-            "role_label": "imported",
-            "kind":       "file",
-            "role":       "dep",
-            "children":   _blocks_for(fp),
-        })
-    for fp in sorted(project_only):
-        groups.append({
-            "id":         f"file::{fp}",
-            "label":      os.path.basename(fp),
-            "role_label": "project",
-            "kind":       "file",
-            "role":       "project",
-            "children":   [],
-        })
-    return groups
+    return [
+        {
+            "id":       f"file::{fp}",
+            "label":    os.path.basename(fp),
+            "children": _blocks_for(fp),
+        }
+        for fp in sorted(loaded)
+    ]
 
 
 def _push_scene(all_actors: list, hits: int) -> None:
@@ -936,9 +902,15 @@ def _push_scene(all_actors: list, hits: int) -> None:
         _view.update()
     print(f"[b3d] {len(all_actors)} shape(s), {hits} cached")
     if _server is not None:
+        tree_data = _build_ast_tree_data()
         with _server.state:
-            _server.state.shape_count = len(all_actors)
-            _server.state.ast_tree    = _build_ast_tree_data()
+            _server.state.shape_count  = len(all_actors)
+            _server.state.ast_tree     = tree_data
+            # Keep files the user collapsed; auto-open any newly added file
+            existing_open = set(_server.state.opened_files or [])
+            known_ids     = {f["id"] for f in (_server.state.ast_tree or [])}
+            new_ids       = {f["id"] for f in tree_data} - known_ids
+            _server.state.opened_files = list(existing_open | new_ids)
 
 
 def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
@@ -1078,8 +1050,10 @@ def _build_ui(server, filepaths, initial_count=0):
     global _view
     state, ctrl = server.state, server.controller
 
+    tree_data            = _build_ast_tree_data()
     state.shape_count    = initial_count
-    state.ast_tree       = _build_ast_tree_data()
+    state.ast_tree       = tree_data
+    state.opened_files   = [f["id"] for f in tree_data]
     state.panel_open     = False
     state.panel_width    = 260
     state.activated_node = []
@@ -1185,67 +1159,63 @@ def _build_ui(server, filepaths, initial_count=0):
         layout.title.set_text("build123d")
 
         layout.root.add_child("""<style id="b3d-panel-styles">
-/* ── Navigation drawer: glass-morphism ── */
+/* ── Navigation drawer ── */
 .b3d-drawer {
-  background: rgba(15, 15, 20, 0.97) !important;
-  border-right: 1px solid rgba(255,255,255,0.07) !important;
-  box-shadow: 6px 0 32px rgba(0,0,0,0.5) !important;
+  background: rgba(12, 12, 17, 0.98) !important;
+  border-right: 1px solid rgba(255,255,255,0.06) !important;
 }
 
-/* ── File group header ── */
-.b3d-file-header {
-  letter-spacing: 0.09em !important;
-  font-size: 0.68rem !important;
-}
-.b3d-file-watched {
-  color: rgb(var(--v-theme-primary)) !important;
-  opacity: 0.9;
-}
-.b3d-file-dep {
-  opacity: 0.55;
-}
-.b3d-file-project {
-  opacity: 0.35;
-  font-style: italic;
+/* ── File group header (VListGroup activator) ── */
+.b3d-file-item .v-list-item-title {
+  font-size: 0.72rem !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.07em !important;
+  text-transform: uppercase !important;
 }
 
-/* ── Block items: smooth colour transitions ── */
-.b3d-item {
-  cursor: pointer;
-  transition: background-color 0.25s ease,
-              color 0.25s ease,
-              opacity 0.2s ease !important;
+/* ── Block items ── */
+.b3d-block-item {
+  cursor: pointer !important;
+  transition: background-color 0.18s ease, opacity 0.18s ease !important;
 }
-.b3d-item:hover {
-  background: rgba(255,255,255,0.06) !important;
+.b3d-block-item .v-list-item-title {
+  font-family: ui-monospace, 'Cascadia Code', 'JetBrains Mono', monospace !important;
+  font-size: 0.73rem !important;
+}
+.b3d-block-item:hover {
+  background: rgba(255,255,255,0.05) !important;
+}
+.b3d-block-hidden {
+  opacity: 0.35 !important;
 }
 
-/* ── "Rebuilt" flash on status change ── */
+/* ── "Rebuilt" flash ── */
 @keyframes b3d-flash {
-  0%   { box-shadow: inset 0 0 0 1px rgba(var(--v-theme-primary), 0.9); }
-  100% { box-shadow: inset 0 0 0 1px transparent; }
+  0%   { box-shadow: inset 2px 0 0 rgb(var(--v-theme-primary)); }
+  100% { box-shadow: inset 2px 0 0 transparent; }
 }
 .b3d-item-rebuilt {
-  animation: b3d-flash 0.7s ease-out;
+  animation: b3d-flash 0.6s ease-out;
 }
 
-/* ── Error status: subtle red left border ── */
+/* ── Error state ── */
 .b3d-item-error {
-  border-left: 2px solid rgba(var(--v-theme-error), 0.7) !important;
+  border-left: 2px solid rgba(var(--v-theme-error), 0.65) !important;
 }
 
-/* ── Resize handle: highlight on hover ── */
+/* ── Resize handle ── */
 .b3d-resize {
-  transition: background-color 0.15s ease !important;
+  transition: background-color 0.12s ease !important;
 }
 .b3d-resize:hover {
-  background-color: rgba(255,255,255,0.18) !important;
+  background-color: rgba(255,255,255,0.15) !important;
 }
 
-/* ── Shape count header ── */
+/* ── Shape count ── */
 .b3d-shape-count {
-  letter-spacing: 0.08em !important;
-  opacity: 0.8;
+  font-size: 0.67rem !important;
+  letter-spacing: 0.07em !important;
+  opacity: 0.65;
 }
 </style>""")
 
@@ -1325,50 +1295,53 @@ def _build_ui(server, filepaths, initial_count=0):
                 ),
             )
             # ── Header ───────────────────────────────────────────────────────
-            with vuetify3.VList(density="compact"):
+            with vuetify3.VList(density="compact", classes="pb-0"):
                 vuetify3.VListSubheader(
                     "{{ shape_count }} shape(s)",
                     classes="text-caption font-weight-bold text-uppercase b3d-shape-count",
                 )
             vuetify3.VDivider()
-            # ── File groups ──────────────────────────────────────────────────
-            with vuetify3.VList(density="compact", nav=True, classes="pa-2"):
-                with vuetify3.Template(
-                    v_for="group in ast_tree",
-                    key=("group.id",),
-                ):
-                    vuetify3.VListSubheader(
-                        "{{ group.label }}{{ group.role_label ? '  ·  ' + group.role_label : '' }}",
-                        classes=(
-                            "'text-caption font-weight-bold text-uppercase b3d-file-header mt-1'"
-                            " + (group.role === 'watched' ? ' b3d-file-watched'"
-                            "    : group.role === 'dep'   ? ' b3d-file-dep' : ' b3d-file-project')",
-                        ),
-                    )
-                    vuetify3.VListItem(
-                        v_for="block in group.children",
-                        key=("block.id",),
-                        prepend_icon=(
-                            "block.has_actor && !block.visible ? 'mdi-eye-off-outline'"
-                            " : block.status === 'error'   ? 'mdi-alert-circle-outline'"
-                            " : block.status === 'cached'  ? 'mdi-check-circle-outline'"
-                            " : 'mdi-refresh'",
-                        ),
-                        append_icon=(
-                            "block.has_actor"
-                            " ? (block.visible ? 'mdi-eye-outline' : 'mdi-eye-off-outline')"
-                            " : ''",
-                        ),
-                        title=("block.label",),
-                        base_color=("block.color",),
-                        rounded="lg",
-                        classes=(
-                            "'mb-1 b3d-item'"
-                            " + (block.status === 'rebuilt' ? ' b3d-item-rebuilt' : '')"
-                            " + (block.status === 'error'   ? ' b3d-item-error'   : '')",
-                        ),
-                        click="activated_node = [block.id]",
-                    )
+            # ── File tree (accordion, watched files only) ─────────────────────
+            with vuetify3.VList(
+                density="compact",
+                nav=True,
+                v_model_opened=("opened_files", []),
+                classes="pa-1",
+            ):
+                with vuetify3.Template(v_for="file in ast_tree", key=("file.id",)):
+                    with vuetify3.VListGroup(value=("file.id",)):
+                        with vuetify3.Template(v_slot_activator="{ props }"):
+                            vuetify3.VListItem(
+                                v_bind="props",
+                                prepend_icon="mdi-language-python",
+                                title=("file.label",),
+                                rounded="lg",
+                                classes="b3d-file-item",
+                            )
+                        vuetify3.VListItem(
+                            v_for="block in file.children",
+                            key=("block.id",),
+                            prepend_icon=(
+                                "block.status === 'error'  ? 'mdi-alert-circle-outline'"
+                                " : block.status === 'cached' ? 'mdi-check-circle-outline'"
+                                " : 'mdi-circle-small'",
+                            ),
+                            title=("block.label + '  :' + block.line",),
+                            append_icon=(
+                                "block.has_actor"
+                                " ? (block.visible ? 'mdi-eye-outline' : 'mdi-eye-off-outline')"
+                                " : ''",
+                            ),
+                            base_color=("block.color",),
+                            rounded="lg",
+                            classes=(
+                                "'b3d-block-item'"
+                                " + (block.status === 'rebuilt' ? ' b3d-item-rebuilt' : '')"
+                                " + (block.status === 'error'   ? ' b3d-item-error'   : '')"
+                                " + (!block.visible             ? ' b3d-block-hidden'  : '')",
+                            ),
+                            click="activated_node = [block.id]",
+                        )
 
         with layout.content:
             with vuetify3.VContainer(fluid=True, classes="pa-0 fill-height"):
