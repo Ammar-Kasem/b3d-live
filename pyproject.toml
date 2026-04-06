@@ -15,7 +15,6 @@ dependencies = [
     "trame-vtk>=2.8",
     "trame-vtklocal>=0.8",
     "trame-vuetify>=2.7",
-    "watchfiles>=0.21",
     "tree-sitter>=0.22",
     "tree-sitter-python>=0.23",
     "pygls>=1.3",
@@ -23,8 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-b3d-live = "dev:main"
-b3d-lsp  = "dev:lsp_main"
+b3d-lsp = "dev:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

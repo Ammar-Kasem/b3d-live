@@ -1,23 +1,16 @@
-"""Live build123d viewer — VTK WASM via trame-vtklocal, no server-side GL.
+"""build123d live viewer — LSP-driven, VTK WASM via trame-vtklocal.
 
-Tree-sitter is used for all parsing, giving three advantages over Python's
-built-in ast module:
+The editor runs b3d-lsp as its Python language server.  On every keystroke the
+LSP didChange notification triggers an incremental reload:
 
-  1. Block-level error isolation — if one build block has a syntax error,
-     tree-sitter still finds and re-runs the other blocks normally.  With
-     ast.parse() a single error aborts the whole file.
-
-  2. Metadata-only post-block classification — assignments like
-     `body.part.color = Color(...)` are detected as metadata-only and applied
-     to the cached actor without forcing the block to re-execute.
-
-  3. Cross-file dependency graph — import statements are queried to build a
-     reverse dep graph.  When a helper module changes, only the watched files
-     that actually import it are reloaded.
-
-Change detection uses tree.edit() + old_tree.changed_ranges(new_tree) so only
-blocks whose byte range overlaps the changed region are re-executed.  No
-hashing required.
+  1. Tree-sitter re-parses only the changed bytes.
+  2. Only the build blocks whose byte range overlaps the edit are re-executed.
+  3. Pre-part variable changes (e.g. a shared colour constant) propagate only
+     to the blocks that actually reference that variable.
+  4. Metadata-only assignments (body.part.color = ...) update the cached VTK
+     actor directly without re-executing the block.
+  5. Cross-file dependency graph (via jedi) ensures that when a helper module
+     changes, only the watched files that import it are reloaded.
 """
 
 from __future__ import annotations
@@ -38,10 +31,10 @@ import urllib.parse
 
 logger = logging.getLogger(__name__)
 
-# Heavy deps (vtk, trame, tree-sitter, watchfiles) are imported inside main()
-# so that `b3d-lsp` starts instantly without loading the viewer stack.
+# Heavy deps (vtk, trame, tree-sitter) are imported inside main() so that the
+# process starts instantly before the editor has finished its handshake.
 
-# ── Tree-sitter globals (set by main()) ───────────────────────────────────────
+# ── Tree-sitter globals (set by _init_runtime()) ─────────────────────────────
 _PY_LANGUAGE       = None
 _ts_parser         = None
 _BUILD_BLOCK_QUERY = None
@@ -557,8 +550,8 @@ def _load_actors(filepath: str,
                  source: bytes | None = None) -> tuple[list, int]:
     """Incremental reload driven by Tree-sitter.
 
-    source — pre-loaded bytes (e.g. from LSP didChange).  When None the file
-    is read from disk (watchfiles path).
+    source — pre-loaded bytes from LSP didChange.  When None the file is read
+    from disk (used during initial load).
 
     Uses tree.edit() + raw byte range to identify exactly which blocks changed.
     Collects LSP Diagnostic objects into _file_diagnostics[filepath].
@@ -851,7 +844,7 @@ def _lsp_diag(start_line: int, end_line: int, msg: str):
         ),
         message=msg,
         severity=DiagnosticSeverity.Error,
-        source="b3d-live",
+        source="b3d-lsp",
     )
 
 
@@ -964,7 +957,7 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
     _DEBOUNCE = 0.15  # seconds
     _lsp_loop: list[asyncio.AbstractEventLoop] = []  # captured on first handler call
 
-    b3d = LanguageServer("b3d-live", "v0.2",
+    b3d = LanguageServer("b3d-lsp", "v1.0",
                          text_document_sync_kind=TextDocumentSyncKind.Full)
 
     async def _debounced_reload(ls, fp: str, source: bytes, gen: int) -> None:
@@ -1053,64 +1046,6 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
             _save_session(watched)
 
     return b3d
-
-
-# ── File watcher ──────────────────────────────────────────────────────────────
-
-async def _watch_and_reload(filepaths: list[str]):
-    loop = asyncio.get_running_loop()
-    dirs = list({os.path.dirname(fp) or "." for fp in filepaths})
-
-    try:
-        async for changes in awatch(*dirs):
-            changed_abs = {
-                os.path.abspath(p)
-                for c, p in changes
-                if c in (Change.modified, Change.added)
-                and p.endswith(".py")
-                and os.path.basename(p) not in _VIEWER_FILES
-            }
-            if not changed_abs:
-                continue
-
-            print(f"[b3d] changed  : {', '.join(os.path.basename(p) for p in changed_abs)}")
-            to_reload: set[str] = set()
-            for fp in filepaths:
-                fp_abs = os.path.abspath(fp)
-                if fp_abs in changed_abs:
-                    to_reload.add(fp)
-                elif changed_abs & _dep_graph.get(fp_abs, set()):
-                    # Drop tree so next parse has no prior state
-                    _file_trees.pop(fp_abs, None)
-                    _file_sources.pop(fp_abs, None)
-                    to_reload.add(fp)
-                else:
-                    print(f"[b3d] skip     : {os.path.basename(fp)}  deps={[os.path.basename(d) for d in _dep_graph.get(fp_abs,set())]}")
-
-            if not to_reload:
-                continue
-
-            for p in changed_abs:
-                _invalidate_local_modules(os.path.dirname(p))
-
-            all_actors: list = []
-            total_hits = 0
-            for fp in filepaths:
-                if fp in to_reload:
-                    actors, hits = await loop.run_in_executor(None, _load_actors, fp)
-                    total_hits += hits
-                else:
-                    cache  = _file_cache.get(fp, {})
-                    actors = [a for a, _ in cache.values()]
-                    total_hits += len(actors)
-                all_actors.extend(actors)
-
-            if not all_actors:
-                continue
-
-            _push_scene(all_actors, total_hits)
-    except asyncio.CancelledError:
-        pass
 
 
 # ── Axis snap ─────────────────────────────────────────────────────────────────
@@ -1446,8 +1381,8 @@ def _build_ui(server, filepaths, initial_count=0):
 # ── Shared initialisation ─────────────────────────────────────────────────────
 
 def _init_runtime() -> None:
-    """Import heavy deps and set up global state shared by main() and lsp_main()."""
-    global vtk, awatch, Change, get_server, SinglePageLayout, vuetify3, vtklocal
+    """Import heavy deps and initialise tree-sitter globals."""
+    global vtk, get_server, SinglePageLayout, vuetify3, vtklocal
     global Language, Parser, Query, QueryCursor
     global _PY_LANGUAGE, _ts_parser, _BUILD_BLOCK_QUERY, _IMPORT_QUERY
 
@@ -1457,7 +1392,6 @@ def _init_runtime() -> None:
     from trame.app import get_server
     from trame.ui.vuetify3 import SinglePageLayout
     from trame.widgets import vuetify3, vtklocal
-    from watchfiles import awatch, Change
 
     _PY_LANGUAGE = Language(tree_sitter_python.language())
     _ts_parser   = Parser(_PY_LANGUAGE)
@@ -1495,85 +1429,30 @@ def _load_initial_actors(filepaths: list[str]) -> list:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    global _server
+    """Start the viewer and serve LSP on stdio.
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("files", nargs="*", default=["main.py"])
-    parser.add_argument("--port",     type=int, default=1234)
-    parser.add_argument("--lsp-port", type=int, default=None,
-                        help="Start LSP server on this TCP port (e.g. 2087). "
-                             "Enables live reload from editor on every keystroke.")
-    args = parser.parse_args()
+    The editor runs this as its Python language server.  The browser opens
+    automatically; no separate process is needed.
 
-    _init_runtime()
-
-    filepaths = [os.path.abspath(f) for f in args.files]
-    workdir   = os.path.dirname(filepaths[0]) if filepaths else os.getcwd()
-    _server   = get_server(client_type="vue3")
-
-    _init_jedi(workdir)
-    _setup_vtk()
-
-    all_actors = _load_initial_actors(filepaths)
-
-    _build_ui(_server, filepaths, initial_count=len(all_actors))
-
-    @_server.controller.on_server_ready.add
-    def _open_browser(**_):
-        import webbrowser
-        webbrowser.open(f"http://localhost:{args.port}")
-
-    print(f"[b3d] Watching  : {', '.join(args.files)}")
-    print(f"[b3d] Browser   : http://localhost:{args.port}")
-
-    async def _run():
-        asyncio.create_task(_watch_and_reload(filepaths))
-        if args.lsp_port:
-            import time as _time
-            main_loop = asyncio.get_running_loop()
-            def _lsp_thread():
-                while True:
-                    try:
-                        _build_lsp(filepaths, main_loop).start_tcp(
-                            "127.0.0.1", args.lsp_port
-                        )
-                    except Exception:
-                        traceback.print_exc()
-                    _time.sleep(0.5)
-
-            threading.Thread(target=_lsp_thread, daemon=True).start()
-            print(f"[b3d] LSP       : 127.0.0.1:{args.lsp_port}")
-        await _server.start(exec_mode="task", open_browser=False, port=args.port)
-
-    try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        pass
-
-
-# ── Combined viewer + stdio LSP (editor-as-launcher mode) ────────────────────
-
-def lsp_main():
-    """Self-contained entry point: starts the viewer AND serves LSP on stdio.
-
-    The editor runs this as its language server.  No separate b3d-live process
-    needed — the viewer opens automatically in the browser.
-
-    Helix config example:
-        [language-server.b3d-live]
+    Helix example (~/.config/helix/languages.toml):
+        [language-server.b3d-lsp]
         command = "/path/to/.venv/bin/b3d-lsp"
         args    = ["body.py", "cab.py"]
+
+        [[language]]
+        name = "python"
+        language-servers = ["ruff", "b3d-lsp"]
     """
     global _server
 
-    # Steal the real stdout before anything can pollute it — LSP uses raw bytes
+    # Steal real stdout before anything can write to it — LSP uses raw bytes
     # on stdout.  All print() calls from here on go to stderr (editor log).
     _lsp_out   = sys.stdout.buffer
     sys.stdout = sys.stderr
 
     _init_runtime()
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(prog="b3d-lsp")
     parser.add_argument("files", nargs="*", default=[])
     parser.add_argument("--port", type=int, default=1234)
     args = parser.parse_args()
@@ -1586,7 +1465,6 @@ def lsp_main():
     _setup_vtk()
 
     all_actors = _load_initial_actors(filepaths)
-
     _build_ui(_server, filepaths, initial_count=len(all_actors))
 
     watching = ', '.join(os.path.basename(f) for f in filepaths) if filepaths else "any .py file opened in editor"
@@ -1595,8 +1473,6 @@ def lsp_main():
     print(f"[b3d] LSP       : stdio")
 
     async def _run():
-        if filepaths:
-            asyncio.create_task(_watch_and_reload(filepaths))
         main_loop = asyncio.get_running_loop()
 
         def _lsp_thread():
@@ -1610,7 +1486,7 @@ def lsp_main():
         threading.Thread(target=_lsp_thread, daemon=True).start()
 
         def _open_browser():
-            import time, webbrowser
+            import webbrowser
             time.sleep(2)
             webbrowser.open(f"http://localhost:{args.port}")
         threading.Thread(target=_open_browser, daemon=True).start()
@@ -1621,63 +1497,6 @@ def lsp_main():
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
-
-
-# ── stdio relay (for editors that start LSP servers as subprocesses) ──────────
-
-def lsp_relay():
-    """Relay stdin/stdout to a running b3d-live TCP LSP server.
-
-    Helix, neovim, and other editors that start language servers as subprocesses
-    communicate over stdio.  Run this as the editor's language server command and
-    point it at the TCP port opened by `b3d-live --lsp-port PORT`.
-
-    Usage:
-        b3d-lsp [--port PORT]   (default: 2087)
-    """
-    import socket
-    import threading
-
-    parser = argparse.ArgumentParser(description="Relay stdio ↔ b3d-live LSP server")
-    parser.add_argument("--port", type=int, default=2087)
-    args = parser.parse_args()
-
-    import time
-    _RETRY_SECS = 30
-    sock = None
-    deadline = time.monotonic() + _RETRY_SECS
-    while time.monotonic() < deadline:
-        try:
-            sock = socket.create_connection(("127.0.0.1", args.port), timeout=1)
-            break
-        except (ConnectionRefusedError, TimeoutError, OSError):
-            time.sleep(1)
-    if sock is None:
-        sys.stderr.write(
-            f"[b3d-lsp] Cannot connect to 127.0.0.1:{args.port} after {_RETRY_SECS}s\n"
-            f"[b3d-lsp] Start b3d-live first:  b3d-live body.py --lsp-port {args.port}\n"
-        )
-        sys.exit(1)
-
-    def _stdin_to_sock() -> None:
-        try:
-            while chunk := sys.stdin.buffer.read(4096):
-                sock.sendall(chunk)
-        except Exception:
-            pass
-        finally:
-            sock.shutdown(socket.SHUT_WR)
-
-    threading.Thread(target=_stdin_to_sock, daemon=True).start()
-
-    try:
-        while chunk := sock.recv(4096):
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-    except Exception:
-        pass
-    finally:
-        os._exit(0)  # skip interpreter cleanup — daemon stdin thread holds buffered lock
 
 
 if __name__ == "__main__":
