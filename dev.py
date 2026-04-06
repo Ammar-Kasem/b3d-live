@@ -274,13 +274,21 @@ def _update_dep_graph_ts(filepath: str, tree, source: bytes) -> None:
     _dep_graph[filepath] = deps
 
 
+_VENV_MARKERS = {"site-packages", ".venv", "venv", "__pypackages__"}
+
+
+def _is_local_project_file(path: str) -> bool:
+    """True if the path is a project-local .py file, not an installed package."""
+    return not any(marker in pathlib.Path(path).parts for marker in _VENV_MARKERS)
+
+
 def _update_dep_graph_jedi(filepath: str, source: bytes) -> None:
     """Jedi-based: resolves star imports, aliases, and re-export chains."""
     import jedi
     deps: set[str] = set()
     try:
         script = jedi.Script(
-            source=source.decode("utf-8", errors="replace"),
+            code=source.decode("utf-8", errors="replace"),
             path=filepath,
             project=_jedi_project,
         )
@@ -294,6 +302,7 @@ def _update_dep_graph_jedi(filepath: str, source: bytes) -> None:
                     if (p.endswith(".py")
                             and p != filepath
                             and p.startswith(_jedi_project_path)
+                            and _is_local_project_file(p)
                             and os.path.basename(p) not in _VIEWER_FILES):
                         deps.add(p)
             except Exception:
@@ -315,7 +324,7 @@ def _jedi_all_module_names(filepath: str, source: bytes) -> set[str] | None:
     import jedi
     try:
         script = jedi.Script(
-            source=source.decode("utf-8", errors="replace"),
+            code=source.decode("utf-8", errors="replace"),
             path=filepath,
             project=_jedi_project,
         )
@@ -659,6 +668,10 @@ def _load_actors(filepath: str,
         try:
             code = _compile_block(block_src, filepath, node.start_point[0])
             exec(code, ns)  # noqa: S102
+            # Update sys.modules so names defined inside the block (e.g. body_color
+            # defined inside `with BuildPart() as body:`) are visible to dependents
+            # that do `from body import body_color`.
+            _inject_as_module(filepath, ns)
         except Exception as exc:
             print(f"[b3d] Block '{var_name}' error: {exc}")
             line = _exc_line(exc, filepath)
