@@ -949,8 +949,10 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
     from pygls.lsp.server import LanguageServer
     from lsprotocol.types import (
         TEXT_DOCUMENT_DID_OPEN, TEXT_DOCUMENT_DID_CHANGE, TEXT_DOCUMENT_DID_SAVE,
+        TEXT_DOCUMENT_DID_CLOSE,
         DidOpenTextDocumentParams, DidChangeTextDocumentParams,
-        DidSaveTextDocumentParams, TextDocumentSyncKind,
+        DidSaveTextDocumentParams, DidCloseTextDocumentParams,
+        TextDocumentSyncKind,
     )
 
     # mutable: grows as the editor opens new .py files
@@ -1038,6 +1040,13 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
             except OSError:
                 return
             _trigger(ls, fp, source)
+
+    @b3d.feature(TEXT_DOCUMENT_DID_CLOSE)
+    def did_close(ls, params: DidCloseTextDocumentParams) -> None:
+        fp = _uri_to_abspath(params.text_document.uri)
+        if fp in watched:
+            watched.discard(fp)
+            _save_session(watched)
 
     return b3d
 
