@@ -340,6 +340,26 @@ def _scan_project_files() -> list[str]:
     return result
 
 
+def _inject_as_module(filepath: str, namespace: dict) -> None:
+    """Publish an executed namespace into sys.modules under the file's stem name.
+
+    This lets dependent files do `from body import body_color` and receive the
+    freshly executed value even when body.py has not been saved to disk yet
+    (LSP keystroke mode).  Only applies to flat local files; package imports
+    with dotted names are handled by the normal import system.
+    """
+    import types as _pytypes
+    mod_name = os.path.splitext(os.path.basename(filepath))[0]
+    existing = sys.modules.get(mod_name)
+    if existing is not None and getattr(existing, "__file__", None) == filepath:
+        existing.__dict__.update(namespace)
+    else:
+        mod = _pytypes.ModuleType(mod_name)
+        mod.__dict__.update(namespace)
+        mod.__file__ = filepath
+        sys.modules[mod_name] = mod
+
+
 def _init_jedi(workdir: str) -> None:
     global _jedi_project, _jedi_project_path
     try:
@@ -584,6 +604,10 @@ def _load_actors(filepath: str,
         return [a for a, _ in cache.values()], 0
     finally:
         _unstub_show_modules()
+
+    # Publish the namespace so dependents can `from body import body_color`
+    # and get the freshly executed value before the file is saved to disk.
+    _inject_as_module(filepath, base_ns)
 
     cache           = _file_cache.setdefault(filepath, {})
     actors:    list                = []
@@ -887,11 +911,31 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
         await asyncio.sleep(_DEBOUNCE)
         if _lsp_gen.get(fp) != gen:   # superseded by a newer edit
             return
+
+        fp_abs = os.path.abspath(fp)
+
+        # Drop cached module so dependents re-import the fresh namespace
+        _invalidate_local_modules(os.path.dirname(fp_abs))
+
         actors, hits = await main_loop.run_in_executor(None, _load_actors, fp, source)
+
+        # Reload other watched files that list fp_abs as a dependency
+        dependents = [p for p in watched
+                      if p != fp_abs and fp_abs in _dep_graph.get(p, set())]
+        dep_actors: dict[str, list] = {}
+        for dep_path in dependents:
+            _file_trees.pop(dep_path, None)
+            _file_sources.pop(dep_path, None)
+            d_actors, d_hits = await main_loop.run_in_executor(None, _load_actors, dep_path)
+            dep_actors[dep_path] = d_actors
+            hits += d_hits
+
         all_actors = []
         for p_abs in list(watched):
-            if p_abs == fp:
+            if p_abs == fp_abs:
                 all_actors.extend(actors)
+            elif p_abs in dep_actors:
+                all_actors.extend(dep_actors[p_abs])
             else:
                 all_actors.extend(a for a, _ in _file_cache.get(p_abs, {}).values())
         _push_scene(all_actors, hits)
