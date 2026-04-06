@@ -9,3 +9,4 @@ build/
 uv.lock
 *.swp
 .DS_Store
+.b3d-session

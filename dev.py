@@ -26,6 +26,7 @@ import argparse
 import ast
 import asyncio
 import os
+import json
 import pathlib
 import sys
 import traceback
@@ -350,6 +351,29 @@ def _jedi_all_module_names(filepath: str, source: bytes) -> set[str] | None:
         )}
     except Exception:
         return None
+
+
+def _session_path() -> str:
+    base = _jedi_project_path or os.getcwd()
+    return os.path.join(base, ".b3d-session")
+
+
+def _save_session(watched: set[str]) -> None:
+    """Persist watched file list so it survives LSP restarts."""
+    try:
+        with open(_session_path(), "w") as f:
+            json.dump(sorted(watched), f)
+    except Exception:
+        pass
+
+
+def _load_session() -> list[str]:
+    """Return watched files from the last session that still exist on disk."""
+    try:
+        with open(_session_path()) as f:
+            return [p for p in json.load(f) if os.path.isfile(p)]
+    except Exception:
+        return []
 
 
 def _scan_project_files() -> list[str]:
@@ -988,7 +1012,9 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
             _lsp_loop.append(asyncio.get_running_loop())
         fp = _uri_to_abspath(params.text_document.uri)
         if fp.endswith(".py") and os.path.basename(fp) not in _VIEWER_FILES:
-            watched.add(fp)   # auto-watch any .py file the editor opens
+            if fp not in watched:
+                watched.add(fp)
+                _save_session(watched)   # persist so restart can restore it
         if fp in watched:
             _trigger(ls, fp, params.text_document.text.encode())
 
@@ -1556,6 +1582,13 @@ def lsp_main():
     _server   = get_server(client_type="vue3")
 
     _init_jedi(workdir)
+
+    # Restore files watched in the previous session (survives LSP restarts)
+    for fp in _load_session():
+        if fp not in filepaths:
+            filepaths.append(fp)
+            print(f"[b3d] Restored  : {os.path.basename(fp)}")
+
     _setup_vtk()
 
     all_actors: list = []
@@ -1571,7 +1604,7 @@ def lsp_main():
 
     _build_ui(_server, filepaths, initial_count=len(all_actors))
 
-    watching = ', '.join(args.files) if args.files else "any .py file opened in editor"
+    watching = ', '.join(os.path.basename(f) for f in filepaths) if filepaths else "any .py file opened in editor"
     print(f"[b3d] Watching  : {watching}")
     print(f"[b3d] Browser   : http://localhost:{args.port}")
     print(f"[b3d] LSP       : stdio")
