@@ -70,6 +70,10 @@ _lsp_gen:          dict[str, int]  = {}   # filepath -> debounce generation coun
 # filepath -> {var_name -> "cached" | "rebuilt" | "error"}
 _block_status: dict[str, dict[str, str]] = {}
 
+# Jedi semantic analysis (set by _init_jedi)
+_jedi_project      = None
+_jedi_project_path: str = ""
+
 
 # ── Tree-sitter helpers ────────────────────────────────────────────────────────
 
@@ -251,6 +255,14 @@ def _parse_metadata_stmt(node, source: bytes) -> tuple[str, str, str] | None:
 
 
 def _update_dep_graph(filepath: str, tree, source: bytes) -> None:
+    if _jedi_project is not None:
+        _update_dep_graph_jedi(filepath, source)
+    else:
+        _update_dep_graph_ts(filepath, tree, source)
+
+
+def _update_dep_graph_ts(filepath: str, tree, source: bytes) -> None:
+    """Original tree-sitter import text scan (fallback when jedi unavailable)."""
     local_dir = os.path.dirname(filepath)
     caps      = QueryCursor(_IMPORT_QUERY).captures(tree.root_node)
     deps: set[str] = set()
@@ -260,6 +272,86 @@ def _update_dep_graph(filepath: str, tree, source: bytes) -> None:
         if os.path.exists(candidate) and candidate != filepath:
             deps.add(candidate)
     _dep_graph[filepath] = deps
+
+
+def _update_dep_graph_jedi(filepath: str, source: bytes) -> None:
+    """Jedi-based: resolves star imports, aliases, and re-export chains."""
+    import jedi
+    deps: set[str] = set()
+    try:
+        script = jedi.Script(
+            source=source.decode("utf-8", errors="replace"),
+            path=filepath,
+            project=_jedi_project,
+        )
+        for name in script.get_names(all_scopes=False, definitions=True, references=False):
+            try:
+                for defn in name.goto():
+                    mp = defn.module_path
+                    if mp is None:
+                        continue
+                    p = str(mp)
+                    if (p.endswith(".py")
+                            and p != filepath
+                            and p.startswith(_jedi_project_path)
+                            and os.path.basename(p) not in _VIEWER_FILES):
+                        deps.add(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _dep_graph[filepath] = deps
+
+
+def _jedi_all_module_names(filepath: str, source: bytes) -> set[str] | None:
+    """Return all names available at module scope via jedi (resolves star imports).
+
+    Used as a fallback when _defined_names returns None (e.g. `from x import *`):
+    instead of invalidating every block, we enumerate the actual names that could
+    have changed so only blocks that reference them need re-execution.
+    """
+    if _jedi_project is None:
+        return None
+    import jedi
+    try:
+        script = jedi.Script(
+            source=source.decode("utf-8", errors="replace"),
+            path=filepath,
+            project=_jedi_project,
+        )
+        return {n.name for n in script.get_names(
+            all_scopes=False, definitions=True, references=False
+        )}
+    except Exception:
+        return None
+
+
+def _scan_project_files() -> list[str]:
+    """Return sorted .py files in the project directory, excluding viewer/venv files."""
+    if not _jedi_project_path:
+        return []
+    skip_dirs = {".venv", "venv", "__pycache__", ".git", "node_modules", ".tox", "dist"}
+    result: list[str] = []
+    for root, dirs, files in os.walk(_jedi_project_path):
+        dirs[:] = sorted(d for d in dirs if d not in skip_dirs and not d.startswith("."))
+        for f in sorted(files):
+            if f.endswith(".py") and f not in _VIEWER_FILES:
+                result.append(os.path.abspath(os.path.join(root, f)))
+    return result
+
+
+def _init_jedi(workdir: str) -> None:
+    global _jedi_project, _jedi_project_path
+    try:
+        import jedi
+        _jedi_project_path = os.path.abspath(workdir)
+        _jedi_project = jedi.Project(
+            path=_jedi_project_path,
+            added_sys_path=[_jedi_project_path],
+        )
+        print(f"[b3d] Jedi project : {_jedi_project_path}")
+    except ImportError:
+        print("[b3d] jedi not found — using tree-sitter for dep graph")
 
 
 def _compile_block(block_src: str, filepath: str, start_row: int):
@@ -467,7 +559,13 @@ def _load_actors(filepath: str,
                                 and r.end_byte > child.start_byte):
                             names = _defined_names(child)
                             if names is None:
-                                changed_pre_part_vars = None  # fallback
+                                # Try jedi to resolve star imports to actual names;
+                                # if that also fails, fall back to invalidate-all.
+                                jedi_names = _jedi_all_module_names(filepath, source)
+                                if jedi_names is not None and isinstance(changed_pre_part_vars, set):
+                                    changed_pre_part_vars.update(jedi_names)
+                                else:
+                                    changed_pre_part_vars = None
                             elif isinstance(changed_pre_part_vars, set):
                                 changed_pre_part_vars.update(names)
                             break
@@ -655,21 +753,28 @@ _STATUS_COLOR = {"cached": "success", "rebuilt": "primary", "error": "error"}
 
 
 def _build_ast_tree_data() -> list:
-    """Build file → block tree for VTreeview.
+    """Build full project file-tree for the panel.
 
-    Each block node carries only: name, line number, status, visibility.
-    Falls back to the bare cache list on SyntaxError.
+    Three tiers:
+      watched  — files that have been loaded/executed (have actors)
+      dep      — files imported by watched files (via _dep_graph)
+      project  — other .py files discovered in the project directory
     """
-    all_paths = dict.fromkeys(list(_file_sources.keys()) + list(_block_status.keys()))
-    groups = []
+    loaded: set[str] = set(_file_sources.keys()) | set(_block_status.keys())
 
-    for filepath in all_paths:
-        fname    = os.path.basename(filepath)
+    all_deps: set[str] = set()
+    for fp in loaded:
+        all_deps.update(_dep_graph.get(fp, set()))
+    dep_only     = all_deps - loaded
+    project_only = {f for f in _scan_project_files() if f not in loaded and f not in dep_only}
+
+    def _blocks_for(filepath: str) -> list:
         source   = _file_sources.get(filepath, b"")
         cache    = _file_cache.get(filepath, {})
         statuses = _block_status.get(filepath, {})
-
         blocks: list = []
+        if not source:
+            return blocks
         try:
             tree = ast.parse(source)
             for stmt in tree.body:
@@ -690,7 +795,7 @@ def _build_ast_tree_data() -> list:
                     entry  = cache.get(as_name)
                     blocks.append({
                         "id":        f"{filepath}::{as_name}",
-                        "label":     f"{as_name}  · L{stmt.lineno}",
+                        "label":     as_name,
                         "kind":      "block",
                         "status":    status,
                         "visible":   bool(entry[0].GetVisibility()) if entry else False,
@@ -712,16 +817,36 @@ def _build_ast_tree_data() -> list:
                     "color":     _STATUS_COLOR.get(status, "primary"),
                     "children":  [],
                 })
+        return blocks
 
-        if blocks:
-            groups.append({
-                "id":       f"file::{filepath}",
-                "label":    fname,
-                "kind":     "file",
-                "color":    "",
-                "children": blocks,
-            })
-
+    groups: list = []
+    for fp in sorted(loaded):
+        groups.append({
+            "id":         f"file::{fp}",
+            "label":      os.path.basename(fp),
+            "role_label": "",
+            "kind":       "file",
+            "role":       "watched",
+            "children":   _blocks_for(fp),
+        })
+    for fp in sorted(dep_only):
+        groups.append({
+            "id":         f"file::{fp}",
+            "label":      os.path.basename(fp),
+            "role_label": "imported",
+            "kind":       "file",
+            "role":       "dep",
+            "children":   _blocks_for(fp),
+        })
+    for fp in sorted(project_only):
+        groups.append({
+            "id":         f"file::{fp}",
+            "label":      os.path.basename(fp),
+            "role_label": "project",
+            "kind":       "file",
+            "role":       "project",
+            "children":   [],
+        })
     return groups
 
 
@@ -1019,8 +1144,18 @@ def _build_ui(server, filepaths, initial_count=0):
 /* ── File group header ── */
 .b3d-file-header {
   letter-spacing: 0.09em !important;
-  opacity: 0.55;
   font-size: 0.68rem !important;
+}
+.b3d-file-watched {
+  color: rgb(var(--v-theme-primary)) !important;
+  opacity: 0.9;
+}
+.b3d-file-dep {
+  opacity: 0.55;
+}
+.b3d-file-project {
+  opacity: 0.35;
+  font-style: italic;
 }
 
 /* ── Block items: smooth colour transitions ── */
@@ -1152,8 +1287,12 @@ def _build_ui(server, filepaths, initial_count=0):
                     key=("group.id",),
                 ):
                     vuetify3.VListSubheader(
-                        "{{ group.label }}",
-                        classes="text-caption font-weight-bold text-uppercase b3d-file-header mt-1",
+                        "{{ group.label }}{{ group.role_label ? '  ·  ' + group.role_label : '' }}",
+                        classes=(
+                            "'text-caption font-weight-bold text-uppercase b3d-file-header mt-1'"
+                            " + (group.role === 'watched' ? ' b3d-file-watched'"
+                            "    : group.role === 'dep'   ? ' b3d-file-dep' : ' b3d-file-project')",
+                        ),
                     )
                     vuetify3.VListItem(
                         v_for="block in group.children",
@@ -1230,8 +1369,10 @@ def main():
     args = parser.parse_args()
 
     filepaths = [os.path.abspath(f) for f in args.files]
+    workdir   = os.path.dirname(filepaths[0]) if filepaths else os.getcwd()
     _server   = get_server(client_type="vue3")
 
+    _init_jedi(workdir)
     _setup_vtk()
 
     all_actors: list = []
@@ -1334,8 +1475,10 @@ def lsp_main():
     args = parser.parse_args()
 
     filepaths = [os.path.abspath(f) for f in args.files]
-    _server = get_server(client_type="vue3")
+    workdir   = os.path.dirname(filepaths[0]) if filepaths else os.getcwd()
+    _server   = get_server(client_type="vue3")
 
+    _init_jedi(workdir)
     _setup_vtk()
 
     all_actors: list = []
