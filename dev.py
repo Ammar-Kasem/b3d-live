@@ -254,7 +254,24 @@ def _parse_metadata_stmt(node, source: bytes) -> tuple[str, str, str] | None:
     )
 
 
-def _update_dep_graph(filepath: str, tree, source: bytes) -> None:
+def _imports_changed(tree, changed_ranges) -> bool:
+    """True if any changed byte range overlaps an import statement."""
+    if not changed_ranges:
+        return False
+    for node in tree.root_node.children:
+        if node.type not in ("import_statement", "import_from_statement"):
+            continue
+        for r in changed_ranges:
+            if r.start_byte < node.end_byte and r.end_byte > node.start_byte:
+                return True
+    return False
+
+
+def _update_dep_graph(filepath: str, tree, source: bytes, changed_ranges=None) -> None:
+    # Skip expensive jedi analysis when the file already has a dep entry and no
+    # import statement overlapped the changed byte range.
+    if filepath in _dep_graph and changed_ranges is not None and not _imports_changed(tree, changed_ranges):
+        return
     if _jedi_project is not None:
         _update_dep_graph_jedi(filepath, source)
     else:
@@ -527,7 +544,7 @@ def _load_actors(filepath: str,
 
     _file_trees[filepath]   = new_tree
     _file_sources[filepath] = source
-    _update_dep_graph(filepath, new_tree, source)
+    _update_dep_graph(filepath, new_tree, source, changed_ranges)
 
     build_blocks = _find_build_blocks(new_tree, source)
     if not build_blocks:
@@ -1017,6 +1034,7 @@ async def _watch_and_reload(filepaths: list[str]):
             if not changed_abs:
                 continue
 
+            print(f"[b3d] changed  : {', '.join(os.path.basename(p) for p in changed_abs)}")
             to_reload: set[str] = set()
             for fp in filepaths:
                 fp_abs = os.path.abspath(fp)
@@ -1027,6 +1045,8 @@ async def _watch_and_reload(filepaths: list[str]):
                     _file_trees.pop(fp_abs, None)
                     _file_sources.pop(fp_abs, None)
                     to_reload.add(fp)
+                else:
+                    print(f"[b3d] skip     : {os.path.basename(fp)}  deps={[os.path.basename(d) for d in _dep_graph.get(fp_abs,set())]}")
 
             if not to_reload:
                 continue
