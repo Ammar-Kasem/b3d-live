@@ -30,6 +30,7 @@ import os
 import json
 import pathlib
 import sys
+import time
 import traceback
 import threading
 import types
@@ -77,6 +78,13 @@ _block_status: dict[str, dict[str, str]] = {}
 # Jedi semantic analysis (set by _init_jedi)
 _jedi_project      = None
 _jedi_project_path: str = ""
+
+# Tracks which sys.modules names were injected by each local dirpath so that
+# _invalidate_local_modules can remove them in O(1) without scanning sys.modules.
+_local_module_names: dict[str, set[str]] = {}  # dirpath -> {module_name, ...}
+
+# _scan_project_files result cache — refreshed at most every _SCAN_TTL seconds
+_scan_project_cache: tuple[float, list[str]] = (0.0, [])
 
 
 # ── Tree-sitter helpers ────────────────────────────────────────────────────────
@@ -380,8 +388,18 @@ def _load_session() -> list[str]:
         return []
 
 
+_SCAN_TTL = 5.0  # seconds between os.walk calls
+
 def _scan_project_files() -> list[str]:
-    """Return sorted .py files in the project directory, excluding viewer/venv files."""
+    """Return sorted .py files in the project directory, excluding viewer/venv files.
+
+    Results are cached for _SCAN_TTL seconds to avoid repeated os.walk on every
+    scene push.
+    """
+    global _scan_project_cache
+    ts, cached = _scan_project_cache
+    if time.monotonic() - ts < _SCAN_TTL:
+        return cached
     if not _jedi_project_path:
         return []
     skip_dirs = {".venv", "venv", "__pycache__", ".git", "node_modules", ".tox", "dist"}
@@ -391,6 +409,7 @@ def _scan_project_files() -> list[str]:
         for f in sorted(files):
             if f.endswith(".py") and f not in _VIEWER_FILES:
                 result.append(os.path.abspath(os.path.join(root, f)))
+    _scan_project_cache = (time.monotonic(), result)
     return result
 
 
@@ -412,6 +431,9 @@ def _inject_as_module(filepath: str, namespace: dict) -> None:
         mod.__dict__.update(namespace)
         mod.__file__ = filepath
         sys.modules[mod_name] = mod
+    # Register the module name so _invalidate_local_modules can remove it in O(1)
+    dirpath = os.path.dirname(os.path.abspath(filepath))
+    _local_module_names.setdefault(dirpath, set()).add(mod_name)
 
 
 def _init_jedi(workdir: str) -> None:
@@ -439,10 +461,8 @@ def _compile_block(block_src: str, filepath: str, start_row: int):
 
 def _invalidate_local_modules(dirpath: str) -> None:
     dirpath = os.path.abspath(dirpath)
-    for name in list(sys.modules):
-        f = getattr(sys.modules[name], "__file__", None)
-        if f and os.path.abspath(os.path.dirname(f)) == dirpath:
-            del sys.modules[name]
+    for name in _local_module_names.pop(dirpath, set()):
+        sys.modules.pop(name, None)
 
 
 def _setup_vtk():
@@ -459,16 +479,24 @@ def _setup_vtk():
 
 
 def _shape_to_actor(shape) -> vtk.vtkActor:
+    import numpy as np
+    from vtk.util import numpy_support
+
     vertices, triangles = shape.tessellate(0.5)
 
+    pts_np = np.array([[v.X, v.Y, v.Z] for v in vertices], dtype=np.float64)
     points = vtk.vtkPoints()
-    points.SetNumberOfPoints(len(vertices))
-    for i, v in enumerate(vertices):
-        points.SetPoint(i, v.X, v.Y, v.Z)
+    points.SetData(numpy_support.numpy_to_vtk(pts_np, deep=True))
 
+    tris_np = np.asarray(triangles, dtype=np.int64)
+    n_tris  = len(tris_np)
+    cell_arr = np.empty(n_tris * 4, dtype=np.int64)
+    cell_arr[0::4] = 3
+    cell_arr[1::4] = tris_np[:, 0]
+    cell_arr[2::4] = tris_np[:, 1]
+    cell_arr[3::4] = tris_np[:, 2]
     cells = vtk.vtkCellArray()
-    for tri in triangles:
-        cells.InsertNextCell(3, tri)
+    cells.SetCells(n_tris, numpy_support.numpy_to_vtkIdTypeArray(cell_arr, deep=True))
 
     poly = vtk.vtkPolyData()
     poly.SetPoints(points)
@@ -851,54 +879,26 @@ def _build_ast_tree_data() -> list:
     project_only = {f for f in _scan_project_files() if f not in loaded and f not in dep_only}
 
     def _blocks_for(filepath: str) -> list:
+        tree     = _file_trees.get(filepath)
         source   = _file_sources.get(filepath, b"")
         cache    = _file_cache.get(filepath, {})
         statuses = _block_status.get(filepath, {})
+        if not tree or not source:
+            return []
         blocks: list = []
-        if not source:
-            return blocks
-        try:
-            tree = ast.parse(source)
-            for stmt in tree.body:
-                if not isinstance(stmt, ast.With):
-                    continue
-                for item in stmt.items:
-                    if not isinstance(item.context_expr, ast.Call):
-                        continue
-                    func = item.context_expr.func
-                    ctx  = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-                    if ctx not in _BUILD_CTXS:
-                        continue
-                    as_name = (item.optional_vars.id
-                               if isinstance(item.optional_vars, ast.Name) else None)
-                    if not as_name:
-                        continue
-                    status = statuses.get(as_name, "rebuilt")
-                    entry  = cache.get(as_name)
-                    blocks.append({
-                        "id":        f"{filepath}::{as_name}",
-                        "label":     as_name,
-                        "kind":      "block",
-                        "status":    status,
-                        "visible":   bool(entry[0].GetVisibility()) if entry else False,
-                        "has_actor": entry is not None,
-                        "color":     _STATUS_COLOR.get(status, "primary"),
-                        "children":  [],
-                    })
-                    break
-        except SyntaxError:
-            for var_name, (actor, _) in cache.items():
-                status = statuses.get(var_name, "rebuilt")
-                blocks.append({
-                    "id":        f"{filepath}::{var_name}",
-                    "label":     var_name,
-                    "kind":      "block",
-                    "status":    status,
-                    "visible":   bool(actor.GetVisibility()),
-                    "has_actor": True,
-                    "color":     _STATUS_COLOR.get(status, "primary"),
-                    "children":  [],
-                })
+        for var_name, node in _find_build_blocks(tree, source):
+            status = statuses.get(var_name, "rebuilt")
+            entry  = cache.get(var_name)
+            blocks.append({
+                "id":        f"{filepath}::{var_name}",
+                "label":     var_name,
+                "kind":      "block",
+                "status":    status,
+                "visible":   bool(entry[0].GetVisibility()) if entry else False,
+                "has_actor": entry is not None,
+                "color":     _STATUS_COLOR.get(status, "primary"),
+                "children":  [],
+            })
         return blocks
 
     groups: list = []
@@ -961,7 +961,7 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
 
     # mutable: grows as the editor opens new .py files
     watched: set[str] = {os.path.abspath(fp) for fp in filepaths}
-    _DEBOUNCE = 0.3   # seconds
+    _DEBOUNCE = 0.15  # seconds
     _lsp_loop: list[asyncio.AbstractEventLoop] = []  # captured on first handler call
 
     b3d = LanguageServer("b3d-live", "v0.2",
@@ -1583,13 +1583,6 @@ def lsp_main():
     _server   = get_server(client_type="vue3")
 
     _init_jedi(workdir)
-
-    # Restore files watched in the previous session (survives LSP restarts)
-    for fp in _load_session():
-        if fp not in filepaths:
-            filepaths.append(fp)
-            print(f"[b3d] Restored  : {os.path.basename(fp)}")
-
     _setup_vtk()
 
     all_actors = _load_initial_actors(filepaths)
