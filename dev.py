@@ -903,14 +903,15 @@ def _push_scene(all_actors: list, hits: int) -> None:
     print(f"[b3d] {len(all_actors)} shape(s), {hits} cached")
     if _server is not None:
         tree_data = _build_ast_tree_data()
+        # Compute new file IDs BEFORE updating state so we can diff old vs new.
+        prev_ids  = {f["id"] for f in (_server.state.ast_tree or [])}
+        truly_new = {f["id"] for f in tree_data} - prev_ids
         with _server.state:
             _server.state.shape_count  = len(all_actors)
             _server.state.ast_tree     = tree_data
-            # Keep files the user collapsed; auto-open any newly added file
+            # Preserve user-collapsed state; auto-open any file not seen before
             existing_open = set(_server.state.opened_files or [])
-            known_ids     = {f["id"] for f in (_server.state.ast_tree or [])}
-            new_ids       = {f["id"] for f in tree_data} - known_ids
-            _server.state.opened_files = list(existing_open | new_ids)
+            _server.state.opened_files = list(existing_open | truly_new)
 
 
 def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
@@ -939,9 +940,11 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
 
         fp_abs = os.path.abspath(fp)
 
-        # Drop cached module so dependents re-import the fresh namespace
-        _invalidate_local_modules(os.path.dirname(fp_abs))
-
+        # Load the changed file — _inject_as_module will update sys.modules in-place
+        # so dependents can import from it.  We intentionally do NOT call
+        # _invalidate_local_modules here: if body.py has a runtime error the OLD
+        # sys.modules['body'].body_color remains, which is better than an ImportError
+        # in every file that imports from it.
         actors, hits = await main_loop.run_in_executor(None, _load_actors, fp, source)
 
         # Reload other watched files that list fp_abs as a dependency
@@ -949,9 +952,14 @@ def _build_lsp(filepaths: list[str], main_loop: asyncio.AbstractEventLoop):
                       if p != fp_abs and fp_abs in _dep_graph.get(p, set())]
         dep_actors: dict[str, list] = {}
         for dep_path in dependents:
-            _file_trees.pop(dep_path, None)
-            _file_sources.pop(dep_path, None)
-            d_actors, d_hits = await main_loop.run_in_executor(None, _load_actors, dep_path)
+            # Grab the editor's latest in-memory source before clearing caches.
+            # Passing it explicitly means we reload what the user sees, not what
+            # is on disk (the two may differ in LSP keystroke mode).
+            dep_source = _file_sources.pop(dep_path, None)
+            _file_trees.pop(dep_path, None)   # clear tree → forces full rebuild
+            d_actors, d_hits = await main_loop.run_in_executor(
+                None, _load_actors, dep_path, dep_source
+            )
             dep_actors[dep_path] = d_actors
             hits += d_hits
 
@@ -1159,13 +1167,14 @@ def _build_ui(server, filepaths, initial_count=0):
         layout.title.set_text("build123d")
 
         layout.root.add_child("""<style id="b3d-panel-styles">
-/* ── Navigation drawer ── */
-.b3d-drawer {
-  background: rgba(12, 12, 17, 0.98) !important;
-  border-right: 1px solid rgba(255,255,255,0.06) !important;
+/* ── Floating panel card ── */
+.b3d-panel {
+  background: rgba(14, 14, 20, 0.97) !important;
+  border: 1px solid rgba(255,255,255,0.07) !important;
+  backdrop-filter: blur(8px) !important;
 }
 
-/* ── File group header (VListGroup activator) ── */
+/* ── File group header ── */
 .b3d-file-item .v-list-item-title {
   font-size: 0.72rem !important;
   font-weight: 600 !important;
@@ -1189,16 +1198,14 @@ def _build_ui(server, filepaths, initial_count=0):
   opacity: 0.35 !important;
 }
 
-/* ── "Rebuilt" flash ── */
+/* ── Rebuilt flash (left-edge inset) ── */
 @keyframes b3d-flash {
   0%   { box-shadow: inset 2px 0 0 rgb(var(--v-theme-primary)); }
   100% { box-shadow: inset 2px 0 0 transparent; }
 }
-.b3d-item-rebuilt {
-  animation: b3d-flash 0.6s ease-out;
-}
+.b3d-item-rebuilt { animation: b3d-flash 0.6s ease-out; }
 
-/* ── Error state ── */
+/* ── Error left border ── */
 .b3d-item-error {
   border-left: 2px solid rgba(var(--v-theme-error), 0.65) !important;
 }
@@ -1206,16 +1213,22 @@ def _build_ui(server, filepaths, initial_count=0):
 /* ── Resize handle ── */
 .b3d-resize {
   transition: background-color 0.12s ease !important;
+  border-radius: 0 12px 12px 0 !important;
 }
-.b3d-resize:hover {
-  background-color: rgba(255,255,255,0.15) !important;
-}
+.b3d-resize:hover { background-color: rgba(255,255,255,0.12) !important; }
 
 /* ── Shape count ── */
 .b3d-shape-count {
   font-size: 0.67rem !important;
   letter-spacing: 0.07em !important;
   opacity: 0.65;
+}
+
+/* ── Legend row ── */
+.b3d-legend .v-list-item-title {
+  font-size: 0.65rem !important;
+  opacity: 0.55;
+  letter-spacing: 0.04em !important;
 }
 </style>""")
 
@@ -1268,21 +1281,27 @@ def _build_ui(server, filepaths, initial_count=0):
 
             vuetify3.VSpacer()
 
-        # Hamburger button opens the left panel
+        # Hamburger button toggles the floating panel
         layout.icon.click = "panel_open = !panel_open"
 
-        with vuetify3.VNavigationDrawer(
-            v_model=("panel_open", False),
-            location="left",
-            width=("panel_width", 260),
-            classes="b3d-drawer",
+        # ── Floating panel (fixed, auto-height, does not push VTK view) ──────
+        with vuetify3.VCard(
+            v_show=("panel_open", False),
+            rounded="lg",
+            elevation=6,
+            classes="b3d-panel",
+            style=(
+                "'position:fixed;top:56px;left:8px;z-index:200;"
+                "width:'+panel_width+'px;"
+                "max-height:calc(100vh - 72px);overflow-y:auto;overflow-x:hidden;'",
+            ),
         ):
             # ── Drag-resize handle on the right edge ─────────────────────────
             vuetify3.VSheet(
                 classes="b3d-resize",
                 style=(
                     "position:absolute;right:0;top:0;bottom:0;width:5px;"
-                    "cursor:col-resize;z-index:10;"
+                    "cursor:col-resize;z-index:10;background:transparent;"
                 ),
                 mousedown=(
                     "(e => {"
@@ -1294,8 +1313,8 @@ def _build_ui(server, filepaths, initial_count=0):
                     "})($event)"
                 ),
             )
-            # ── Header ───────────────────────────────────────────────────────
-            with vuetify3.VList(density="compact", classes="pb-0"):
+            # ── Shape count header ────────────────────────────────────────────
+            with vuetify3.VList(density="compact", classes="pb-0 pt-1"):
                 vuetify3.VListSubheader(
                     "{{ shape_count }} shape(s)",
                     classes="text-caption font-weight-bold text-uppercase b3d-shape-count",
@@ -1322,7 +1341,7 @@ def _build_ui(server, filepaths, initial_count=0):
                             v_for="block in file.children",
                             key=("block.id",),
                             prepend_icon=(
-                                "block.status === 'error'  ? 'mdi-alert-circle-outline'"
+                                "block.status === 'error'   ? 'mdi-alert-circle-outline'"
                                 " : block.status === 'cached' ? 'mdi-check-circle-outline'"
                                 " : 'mdi-circle-small'",
                             ),
@@ -1342,6 +1361,22 @@ def _build_ui(server, filepaths, initial_count=0):
                             ),
                             click="activated_node = [block.id]",
                         )
+            # ── Color legend ──────────────────────────────────────────────────
+            vuetify3.VDivider()
+            with vuetify3.VList(density="compact", classes="pa-1 pb-2"):
+                for icon, color, label in [
+                    ("mdi-circle-small",         "primary", "rebuilt — re-executed"),
+                    ("mdi-check-circle-outline",  "success", "cached — unchanged"),
+                    ("mdi-alert-circle-outline",  "error",   "error — last good kept"),
+                ]:
+                    vuetify3.VListItem(
+                        prepend_icon=icon,
+                        title=label,
+                        base_color=color,
+                        density="compact",
+                        rounded="lg",
+                        classes="b3d-legend",
+                    )
 
         with layout.content:
             with vuetify3.VContainer(fluid=True, classes="pa-0 fill-height"):
